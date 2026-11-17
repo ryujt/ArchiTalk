@@ -166,7 +166,10 @@ impl App {
     }
     pub fn settings(&self) -> Value {
         let i = self.lock();
-        json!({"settings":i.state.settings,"revision":i.state.settings_revision,"diagnostics":[]})
+        json!({"settings":i.state.settings,"revision":i.state.settings_revision,"diagnostics":[],"choices":{
+            "claude":ai::Backend::Claude.choices(),
+            "codex":ai::Backend::Codex.choices()
+        }})
     }
     pub fn draft(&self, id: &str) -> Result<Value> {
         let i = self.lock();

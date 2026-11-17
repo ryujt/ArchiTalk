@@ -51,6 +51,11 @@ pub enum Backend {
     Claude,
     Codex,
 }
+#[derive(Clone, Debug, Serialize)]
+pub struct BackendChoices {
+    pub models: Vec<String>,
+    pub efforts: Vec<String>,
+}
 impl Backend {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -67,11 +72,32 @@ impl Backend {
     fn efforts(self) -> Vec<String> {
         match self {
             Self::Claude => ["low", "medium", "high", "xhigh", "max"].as_slice(),
-            Self::Codex => ["minimal", "low", "medium", "high", "xhigh"].as_slice(),
+            Self::Codex => ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].as_slice(),
         }
         .iter()
         .map(|s| (*s).to_owned())
         .collect()
+    }
+    /// Known examples, not an allowlist or proof of account/model availability.
+    /// Claude aliases/efforts came from installed help; Codex IDs and max/ultra
+    /// came from local model catalog metadata inspected on 2026-11-18.
+    pub fn choices(self) -> BackendChoices {
+        let models = match self {
+            Self::Claude => ["sonnet", "opus", "fable"].as_slice(),
+            Self::Codex => [
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
+                "gpt-6.1-terra",
+                "gpt-6.1-sol",
+                "gpt-6-astra",
+                "gpt-6-sol",
+            ]
+            .as_slice(),
+        };
+        BackendChoices {
+            models: models.iter().map(|model| (*model).to_owned()).collect(),
+            efforts: self.efforts(),
+        }
     }
 }
 impl std::fmt::Display for Backend {
@@ -653,10 +679,18 @@ fn validate_spec(spec: &RunSpec) -> Result<(), AiError> {
         }
     }
     if let Some(effort) = &spec.effort {
-        if !spec.backend.efforts().contains(effort) {
+        // Effort support is decided by the CLI/model, not these known examples.
+        // A safe token also cannot escape Codex's quoted TOML override argument.
+        if effort.is_empty()
+            || effort.len() > 32
+            || effort.starts_with('-')
+            || !effort
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+        {
             return Err(AiError::new(
                 "invalid_settings",
-                "Effort is not part of the supported backend profile.",
+                "Effort must be a 1–32 character ASCII token using letters, digits, '_' or '-', without a leading '-'.",
             ));
         }
     }
@@ -1552,11 +1586,71 @@ mod tests {
         assert_eq!(args[0], "-p");
         assert!(args.windows(2).any(|a| a == ["--tools", ""]));
         assert!(args.windows(2).any(|a| a == ["--effort", "high"]));
+        spec.model = Some("vendor/future-model:2[1m]".into());
+        for backend in [Backend::Claude, Backend::Codex] {
+            spec.backend = backend;
+            for effort in ["max", "ultra", "future_2-high", &"x".repeat(32)] {
+                spec.effort = Some(effort.into());
+                validate_spec(&spec).unwrap();
+                let args = cli_args(&spec);
+                assert!(
+                    args.windows(2)
+                        .any(|a| a == ["--model", "vendor/future-model:2[1m]"])
+                );
+                match backend {
+                    Backend::Claude => assert!(args.windows(2).any(|a| a == ["--effort", effort])),
+                    Backend::Codex => {
+                        let assignment = &args
+                            .windows(2)
+                            .find(|a| a[0] == "-c" && a[1].starts_with("model_reasoning_effort="))
+                            .unwrap()[1];
+                        let parsed: toml::Value = toml::from_str(assignment).unwrap();
+                        assert_eq!(parsed.as_table().unwrap().len(), 1);
+                        assert_eq!(parsed["model_reasoning_effort"].as_str(), Some(effort));
+                    }
+                }
+            }
+        }
         spec.profile = Some("unsafe".into());
         assert!(validate_spec(&spec).is_err());
         spec.profile = None;
         spec.model = Some("--bad".into());
         assert!(validate_spec(&spec).is_err());
+    }
+    #[test]
+    fn effort_tokens_reject_argument_and_toml_injection() {
+        let mut spec = RunSpec {
+            backend: Backend::Codex,
+            executable: "codex".into(),
+            model: None,
+            effort: None,
+            profile: None,
+            timeout_seconds: 180,
+            prompt: "test".into(),
+            project_root: PathBuf::from("/project"),
+        };
+        for effort in [
+            "",
+            "-high",
+            "high level",
+            "high\"",
+            "high\\",
+            "high\nmodel=\"other\"",
+            "high\r",
+            "high\t",
+            "high\0",
+            "high;touch",
+            "$(touch)",
+            "`touch`",
+            "높음",
+            &"x".repeat(33),
+        ] {
+            spec.effort = Some(effort.into());
+            for backend in [Backend::Claude, Backend::Codex] {
+                spec.backend = backend;
+                assert_eq!(validate_spec(&spec).unwrap_err().code, "invalid_settings");
+            }
+        }
     }
     #[test]
     fn sandbox_profile_escapes_quoted_paths_and_rejects_controls() {

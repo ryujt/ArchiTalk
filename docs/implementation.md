@@ -30,7 +30,7 @@ Rust 바이너리에 `web/` 정적 자산을 포함한다. 시작 시 cwd 또는
 | `GET /runs/{id}/events` | 해당 run의 progress/delta와 세션 상태 변경 |
 | `POST /sessions/{id}/exports` | preview: `draft_id`, 선택적 `directory`; apply: `plan_id` |
 | `GET /sessions/{id}/exports/{id}` | 정확한 파일별 저장 결과 확인 |
-| `GET/PATCH /settings` | 설정 조회 / `payload.settings` 전체 갱신 |
+| `GET/PATCH /settings` | 설정과 알려진 모델·생각 수준 예시(`choices`) 조회 / `payload.settings` 전체 갱신 |
 | `POST /settings/diagnostics` | 모델 호출 없는 설치·버전·필수 옵션 진단 |
 
 `202`는 접수이며 생성 완료가 아니다. SSE delta는 임시 데이터이고 마지막 확정 snapshot이 기준이다. feed를 놓치면 cursor replay 또는 snapshot polling으로 복구한다. UI는 불명확한 저장 응답을 같은 export ID로 조회해 확인하고 새로운 저장을 겹치지 않는다.

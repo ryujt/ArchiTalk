@@ -72,7 +72,10 @@ prompt=sys.stdin.read()
         );
         let executable = fake_cli(fixture.path(), &body);
         let (tx, _rx) = mpsc::channel(1); // Intentionally never drained.
-        let output = ai::generate(spec(executable, root.path()), CancellationToken::new(), tx)
+        let mut request = spec(executable, root.path());
+        request.model = Some("vendor/future-model:2[1m]".into());
+        request.effort = Some("future_2-high".into());
+        let output = ai::generate(request, CancellationToken::new(), tx)
             .await
             .unwrap();
         assert_eq!(output.text, "OK");
@@ -83,6 +86,15 @@ prompt=sys.stdin.read()
         assert!(!denied.exists());
         assert!(!Path::new(record["cwd"].as_str().unwrap()).starts_with(root.path()));
         assert_eq!(record["prompt"], "test -- $(touch ignored)");
+        let argv = record["argv"].as_array().unwrap();
+        assert!(
+            argv.windows(2)
+                .any(|a| { a[0] == "--model" && a[1] == "vendor/future-model:2[1m]" })
+        );
+        assert!(
+            argv.windows(2)
+                .any(|a| a[0] == "--effort" && a[1] == "future_2-high")
+        );
         assert!(
             !record["argv"]
                 .as_array()
@@ -95,22 +107,37 @@ prompt=sys.stdin.read()
     async fn codex_requested_model_is_not_reported_as_resolved_without_cli_evidence() {
         let root = tempfile::tempdir().unwrap();
         let fixture = tempfile::tempdir().unwrap();
-        let executable = fake_cli(
-            fixture.path(),
-            "print(json.dumps({'type':'thread.started'}),flush=True)\nprint(json.dumps({'type':'turn.started'}),flush=True)\nprint(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'OK'}}),flush=True)\nprint(json.dumps({'type':'turn.completed'}),flush=True)",
+        let record = fixture.path().join("argv.json");
+        let body = format!(
+            "with open({},'w') as out:\n    json.dump(sys.argv,out)\nprint(json.dumps({{'type':'thread.started'}}),flush=True)\nprint(json.dumps({{'type':'turn.started'}}),flush=True)\nprint(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text':'OK'}}}}),flush=True)\nprint(json.dumps({{'type':'turn.completed'}}),flush=True)",
+            serde_json::to_string(record.to_str().unwrap()).unwrap()
         );
+        let executable = fake_cli(fixture.path(), &body);
         let mut script = std::fs::read_to_string(&executable).unwrap();
         script=script.replace("2.1.326 (Claude Code)","codex-cli 0.169.0").replace("--print --output-format --include-partial-messages --safe-mode --restricted --strict-mcp-config --mcp-config --setting-sources --settings --tools --permission-mode --disable-slash-commands --no-session-persistence --effort", "--json --ignore-user-config --ignore-rules --ephemeral --sandbox --skip-git-repo-check --disable");
         std::fs::write(&executable, script).unwrap();
-        let mut request = spec(executable, root.path());
-        request.backend = Backend::Codex;
-        request.model = Some("requested-model".into());
-        let (tx, _rx) = mpsc::channel(1);
-        let output = ai::generate(request, CancellationToken::new(), tx)
-            .await
-            .unwrap();
-        assert_eq!(output.text, "OK");
-        assert_eq!(output.resolved_model, None);
+        for effort in ["max", "ultra", "future_2-high"] {
+            let mut request = spec(executable.clone(), root.path());
+            request.backend = Backend::Codex;
+            request.model = Some("gpt-6.2-sol".into());
+            request.effort = Some(effort.into());
+            let (tx, _rx) = mpsc::channel(1);
+            let output = ai::generate(request, CancellationToken::new(), tx)
+                .await
+                .unwrap();
+            assert_eq!(output.text, "OK");
+            assert_eq!(output.resolved_model, None);
+            let argv: Vec<String> =
+                serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+            assert!(argv.windows(2).any(|a| a == ["--model", "gpt-6.2-sol"]));
+            let assignment = &argv
+                .windows(2)
+                .find(|a| a[0] == "-c" && a[1].starts_with("model_reasoning_effort="))
+                .unwrap()[1];
+            let parsed: toml::Value = toml::from_str(assignment).unwrap();
+            assert_eq!(parsed.as_table().unwrap().len(), 1);
+            assert_eq!(parsed["model_reasoning_effort"].as_str(), Some(effort));
+        }
     }
     #[tokio::test]
     async fn cancellation_stops_cli_and_its_process_group() {

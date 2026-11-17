@@ -179,7 +179,7 @@ export function startWorkspace(doc = document, win = window) {
     workspace: null, session: null, run: null, scene: 'loading', panel: 'notes',
     selectedDraft: null, busy: false, error: null, notice: '', live: '', progress: '',
     connection: 'connecting', modal: null, modalError: '', settings: null,
-    diagnostics: null, settingsRevision: null, plan: null, saved: null,
+    diagnostics: null, choices: {}, settingsRevision: null, plan: null, saved: null,
     answer: '', intro: '', cursor: '', feed: null, refreshTimer: null, diagnosticTimer: null,
     contextPaths: new Set(),
     refreshPromise: null, requestEpoch: 0, dialogFocus: null, dialogFocusAction: null,
@@ -536,19 +536,41 @@ export function startWorkspace(doc = document, win = window) {
     if (!dialog.open) dialog.showModal();
   }
 
-  function effortField(name, value, inherit = false) {
-    return `<div class="form-field"><label for="${name}-effort">생각 수준</label><input id="${name}-effort" name="${name}-effort" value="${esc(value || '')}" placeholder="${inherit?'기본 설정 따름':'CLI 기본값'}" maxlength="32" autocomplete="off"><small>선택한 CLI·모델에서 지원하는 값을 직접 입력해요. 빈칸은 ${inherit?'기본 설정':'CLI 기본값'}을 따라요.</small></div>`;
+  function knownChoices(backend, field) {
+    return [...new Set(list(state.choices?.[backend]?.[field==='model'?'models':'efforts']).filter(value=>typeof value==='string' && value))];
+  }
+
+  function choiceOptions(backend, field, value) {
+    const choices=knownChoices(backend,field);
+    return `<option value=""${!choices.includes(value)?' selected':''}>직접 입력</option>${choices.map(choice=>`<option value="${esc(choice)}"${choice===value?' selected':''}>${esc(choice)}</option>`).join('')}`;
+  }
+
+  function settingField(name, field, value, backend, inherit = false) {
+    const id=`${name}-${field}`, label=field==='model'?'모델':'생각 수준';
+    const owner=({claude:'Claude Code',codex:'Codex',conversation:'대화',design:'설계 작성',critic:'비판 검토'})[name];
+    const placeholder=inherit?'선택한 도구의 기본 설정':field==='model'?'CLI 기본 모델':'CLI 기본값';
+    return `<div class="form-field"><label for="${id}">${label}${inherit?' 재정의':''}</label><select class="setting-choice" id="${id}-choice" data-choice-input="${id}" aria-label="${owner} ${label} 목록" aria-describedby="${id}-help">${choiceOptions(backend,field,value || '')}</select><input id="${id}" name="${id}" value="${esc(value || '')}" placeholder="${placeholder}" maxlength="${field==='model'?200:32}" autocomplete="off" spellcheck="false" aria-describedby="${id}-help"><small id="${id}-help">목록에서 고르거나 직접 입력해요. 빈칸은 ${inherit?'선택한 도구의 기본 설정':'CLI 기본값'}을 따라요.</small></div>`;
+  }
+
+  function refreshSettingChoices() {
+    for (const name of ['claude','codex','conversation','design','critic']) {
+      const backend=['claude','codex'].includes(name)?name:($(`${name}-backend`).value || $('default-backend').value);
+      for (const field of ['model','effort']) {
+        const input=$(`${name}-${field}`), choice=$(`${name}-${field}-choice`);
+        choice.innerHTML=choiceOptions(backend,field,input.value.trim());
+      }
+    }
   }
 
   function settingsModal() {
     const settings = state.settings || {}, ai = settings.ai || {}, backends = ai.backends || {};
     return `${header('답변에 사용할 도구')}<div class="dialog-body"><p>로컬 Claude Code 또는 Codex의 기존 로그인을 사용해요. 설치·help 진단은 로그인이나 모델 응답을 시험하지 않아요.</p><div id="modal-error">${modalError()}</div><form id="settings-form"><div class="form-field"><label for="default-backend">기본 도구</label><select id="default-backend" name="default-backend">${['claude','codex'].map(kind=>`<option value="${kind}"${(ai.default_backend||'claude')===kind?' selected':''}>${kind==='claude'?'Claude Code':'Codex'}</option>`).join('')}</select></div><div class="diagnostics" id="cli-diagnostics">${diagnosticsHTML()}</div>${button('diagnose','설치·버전 진단','secondary',state.busy)}${['claude','codex'].map(kind=>{
       const base=backends[kind] || {};
-      const efforts=list(state.diagnostics).find(item=>item.backend===kind)?.efforts || [];
-      return `<section class="settings-section"><h3>${kind==='claude'?'Claude Code':'Codex'} 기본 설정</h3><div class="form-field"><label for="${kind}-executable">신뢰된 실행 파일</label><input id="${kind}-executable" readonly value="${esc(base.executable || kind)}"><small>실행 파일 변경은 터미널의 사용자 전역 설정에서 해 주세요.</small></div>${kind==='codex'?`<div class="form-field"><label for="codex-profile">Codex profile</label><input id="codex-profile" readonly value="${esc(base.profile || 'CLI 기본 profile')}"><small>신뢰된 사용자 전역 설정의 profile을 사용해요.</small></div>`:''}<div class="field-grid"><div class="form-field"><label for="${kind}-model">모델 · 직접 입력</label><input id="${kind}-model" name="${kind}-model" value="${esc(base.model || '')}" placeholder="CLI 기본 모델" maxlength="200" autocomplete="off"></div>${effortField(kind,base.effort)}</div><p class="capability-note">${efforts.length?`설치된 도구에서 확인한 옵션: ${esc(efforts.join(', '))}. `:''}선택 모델의 지원은 미확인이에요. 모델에 맞는 값을 입력해 주세요. 빈칸은 CLI 기본값을 사용해요.</p></section>`;
+      return `<section class="settings-section"><h3>${kind==='claude'?'Claude Code':'Codex'} 기본 설정</h3><div class="form-field"><label for="${kind}-executable">신뢰된 실행 파일</label><input id="${kind}-executable" readonly value="${esc(base.executable || kind)}"><small>실행 파일 변경은 터미널의 사용자 전역 설정에서 해 주세요.</small></div>${kind==='codex'?`<div class="form-field"><label for="codex-profile">Codex profile</label><input id="codex-profile" readonly value="${esc(base.profile || 'CLI 기본 profile')}"><small>신뢰된 사용자 전역 설정의 profile을 사용해요.</small></div>`:''}<div class="field-grid">${settingField(kind,'model',base.model,kind)}${settingField(kind,'effort',base.effort,kind)}</div><p class="capability-note">목록은 알려진 값의 예시예요. 계정·CLI·모델별 사용 가능 여부는 실제 요청에서 확인돼요. 목록에 없는 값도 직접 입력할 수 있어요.</p></section>`;
     }).join('')}<details class="settings-section" open><summary>역할마다 다르게 설정하기 · 선택</summary>${['conversation','design','critic'].map((role,i)=>{
       const value=ai.roles?.[role] || {};
-      return `<fieldset class="role-setting"><legend>${['대화','설계 작성','비판 검토'][i]}</legend><div class="field-grid"><div class="form-field"><label for="${role}-backend">사용할 도구</label><select id="${role}-backend" name="${role}-backend"><option value="">기본 도구 따름</option>${['claude','codex'].map(kind=>`<option value="${kind}"${value.backend===kind?' selected':''}>${kind==='claude'?'Claude Code':'Codex'}</option>`).join('')}</select></div><div class="form-field"><label for="${role}-model">모델 재정의</label><input id="${role}-model" name="${role}-model" value="${esc(value.model || '')}" placeholder="선택한 도구의 기본 모델" maxlength="200" autocomplete="off"></div>${effortField(role,value.effort,true)}</div></fieldset>`;
+      const backend=value.backend || ai.default_backend || 'claude';
+      return `<fieldset class="role-setting"><legend>${['대화','설계 작성','비판 검토'][i]}</legend><div class="field-grid"><div class="form-field"><label for="${role}-backend">사용할 도구</label><select id="${role}-backend" name="${role}-backend"><option value="">기본 도구 따름</option>${['claude','codex'].map(kind=>`<option value="${kind}"${value.backend===kind?' selected':''}>${kind==='claude'?'Claude Code':'Codex'}</option>`).join('')}</select></div>${settingField(role,'model',value.model,backend,true)}${settingField(role,'effort',value.effort,backend,true)}</div></fieldset>`;
     }).join('')}</details><div class="connection-notice">설정은 다음 생성부터 적용돼요. 진행 중인 작업은 시작할 때의 설정을 유지해요. 적용 후 작업을 자동으로 재실행하지 않아요.</div><div class="dialog-footer">${button('close-modal','취소','quiet-button',state.busy)}<button type="submit" class="primary"${state.busy?' disabled':''}>다음 작업부터 적용</button></div></form></div>`;
   }
 
@@ -580,6 +602,7 @@ export function startWorkspace(doc = document, win = window) {
       const result = await api(`${API_ROOT}settings`);
       state.settings=result.settings; state.settingsRevision=result.revision;
       state.diagnostics=result.diagnostics;
+      state.choices=result.choices || {};
       state.modal='settings';
     });
   }
@@ -763,6 +786,10 @@ export function startWorkspace(doc = document, win = window) {
   });
 
   doc.addEventListener('input',event=> {
+    if (state.modal==='settings' && /^(claude|codex|conversation|design|critic)-(model|effort)$/.test(event.target.id)) {
+      const choice=$(`${event.target.id}-choice`), value=event.target.value.trim();
+      choice.value=Array.from(choice.options).some(option=>option.value===value)?value:'';
+    }
     if (event.target.id==='answer-input') { state.answer=event.target.value; event.target.setCustomValidity(''); }
     if (event.target.id==='project-intro') { state.intro=event.target.value; event.target.setCustomValidity(''); }
     if (event.target.id==='output-directory' && state.plan) {
@@ -771,6 +798,10 @@ export function startWorkspace(doc = document, win = window) {
     }
   });
   doc.addEventListener('change',event=> {
+    if (state.modal==='settings') {
+      if (event.target.dataset.choiceInput && event.target.value) $(event.target.dataset.choiceInput).value=event.target.value;
+      if (/^(default|conversation|design|critic)-backend$/.test(event.target.id)) refreshSettingChoices();
+    }
     if (event.target.name==='context-path') event.target.checked?state.contextPaths.add(event.target.value):state.contextPaths.delete(event.target.value);
     if (event.target.id==='session-switcher') event.target.value?void selectSession(event.target.value):newSession();
     if (event.target.id==='draft-picker') { state.selectedDraft=event.target.value; render(); }

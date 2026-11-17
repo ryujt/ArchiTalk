@@ -37,6 +37,7 @@
 .finding.resolved{border-color:var(--line);background:var(--paper);color:var(--muted)}
 .session-switcher{display:none}.draft-picker{max-width:200px;font:inherit;font-size:10px;border:1px solid var(--line);border-radius:5px;background:white;padding:5px}
 .form-field input[readonly]{background:#f0f3ee;color:var(--muted)}
+.form-field .setting-choice{margin-bottom:7px}.field-grid>.form-field{min-width:0}
 .dialog-error{margin:16px 0}.dialog-body{overflow-wrap:anywhere}.dialog-header{position:sticky;top:0;background:white;z-index:1}
 .plan-file{padding:12px 0;border-bottom:1px solid var(--line);font-size:11px}.plan-file b{display:block;overflow-wrap:anywhere}.plan-file pre{font-size:10px;max-height:180px;overflow:auto;white-space:pre-wrap}
 .status-detail{margin-top:12px;font-size:11px;color:var(--muted);line-height:1.8;overflow-wrap:anywhere}.workspace-footer{margin-top:30px}.fact-card p{white-space:pre-wrap;overflow-wrap:anywhere}.fact-card .source{overflow-wrap:anywhere}

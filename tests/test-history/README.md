@@ -13,5 +13,8 @@
 | 실제 UI 코드·SSE·상태 | [implementation-web](implementation-web.md) | 초기 Node 19건, 후속 경합 회귀는 브라우저 기록에 연결 |
 | 실제 desktop/mobile UI·모델 설정·저장·복구 | [implementation-web-browser](implementation-web-browser.md) | Node 21건·실제 headless Chrome 2건 통과, 실패/수정 보존 |
 | 전역 CLI 설치 스크립트·PATH | [install-20261118](install-20261118.md) | 상대 prefix·기존 PATH 안내·기본 전역 설치 통과, 독립 검토 반영 |
+| 모델·생각 수준 선택 및 직접 입력 조립 | [model-choices-20261118](model-choices-20261118.md) | Node 21건·clippy·format·최신 전역 설치 통과, 독립 검토 완료 |
+| 모델 선택 metadata·안전한 effort 전달 | [model-choices-backend-20261118](model-choices-backend-20261118.md) | 단위 12건·adapter 8건·HTTP/진단 2건 통과, 실제 CLI 1건 ignored |
+| 실제 모델/effort 선택·직접 입력 UI | [model-choices-browser-20261118](model-choices-browser-20261118.md) | desktop/mobile 기존·신규 4건 통과 |
 
 최초 작업으로 참고할 이전 실행은 없었다. 후속 실행은 각 기록의 미검증·후속 조건을 먼저 확인한다.
