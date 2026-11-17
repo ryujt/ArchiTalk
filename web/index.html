@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <title>ArchiTalk · 설계 워크스페이스</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-left">
+      <a class="brand" href="/" aria-label="ArchiTalk 시작"><span class="brand-mark" aria-hidden="true">a</span>ArchiTalk</a>
+      <span class="project-crumb">프로젝트 <b id="project-name">확인 중</b></span>
+    </div>
+    <div class="header-right">
+      <span class="connection" id="connection" role="status"><span class="connection-dot" aria-hidden="true"></span><span>연결 중</span></span>
+      <button class="quiet-button mobile-info" type="button" data-action="toggle-info" aria-controls="aux-panel" aria-expanded="false">설계 메모</button>
+      <button class="quiet-button" type="button" data-action="settings">도구 설정</button>
+    </div>
+  </header>
+  <div class="app-body">
+    <aside class="sidebar" aria-label="프로젝트와 대화">
+      <div><p class="sidebar-title">현재 프로젝트</p><p class="project-title" id="sidebar-project">확인 중</p><span class="local-label">이 폴더에서 시작한 설계</span><div id="session-list" class="session-list"></div><button class="secondary new-session" type="button" data-action="new-session">＋ 새 대화</button></div>
+      <nav class="steps" aria-label="설계 단계"><span class="step" id="step-interview"><span class="step-number">1</span>이야기 나누기</span><span class="step" id="step-review"><span class="step-number">2</span>초안 살펴보기</span><span class="step" id="step-save"><span class="step-number">3</span>문서에 반영하기</span></nav>
+      <div class="sidebar-bottom"><p>대화는 로컬에 기록돼요.<br>문서는 반영을 선택할 때 저장해요.</p><p id="root-display" class="mono"></p></div>
+    </aside>
+    <main class="workspace" id="main" tabindex="-1">
+      <div class="workspace-top"><div><p class="eyebrow">DESIGN TOGETHER</p><h2 id="workspace-title">프로젝트 설계</h2></div><span class="phase-pill" id="phase">연결 확인</span></div>
+      <select class="session-switcher" id="session-switcher" aria-label="대화 선택"></select>
+      <div id="notice" aria-live="polite"></div>
+      <div class="workspace-content" id="workspace-content"><p class="loading" role="status">로컬 워크스페이스를 확인하고 있어요.</p></div>
+      <footer class="workspace-footer">ArchiTalk · 생각을 나누고, 설계로 남기세요.</footer>
+    </main>
+    <aside class="aux-panel" id="aux-panel" aria-label="설계 참고 정보">
+      <div class="aux-tabs" role="tablist" aria-label="참고 정보"><button class="aux-tab active" id="notes-tab" type="button" role="tab" aria-selected="true" aria-controls="aux-content" data-panel="notes">설계 메모</button><button class="aux-tab" id="documents-tab" type="button" role="tab" aria-selected="false" aria-controls="aux-content" tabindex="-1" data-panel="documents">문서</button></div>
+      <div id="aux-content" role="tabpanel" aria-labelledby="notes-tab"><p class="context-intro">프로젝트의 기록을 확인하고 있어요.</p></div>
+    </aside>
+  </div>
+  <dialog id="scene-dialog" aria-labelledby="dialog-title"></dialog>
+  <div class="sr-only" id="announcer" role="status" aria-live="polite"></div>
+  <noscript><p>ArchiTalk 워크스페이스를 사용하려면 JavaScript를 켜 주세요.</p></noscript>
+</body>
+</html>

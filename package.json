@@ -1,0 +1,12 @@
+{
+  "name": "architalk-browser-tests",
+  "private": true,
+  "scripts": {
+    "test:web": "node --test tests/web.test.mjs",
+    "pretest:browser": "cargo build --bin architalk",
+    "test:browser": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.1"
+  }
+}

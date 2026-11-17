@@ -1,0 +1,28 @@
+[ai]
+default_backend = "claude"
+timeout_seconds = 180
+
+[ai.backends.claude]
+executable = "claude"
+# model = "your-installed-model-id"
+# effort = "high"
+
+[ai.backends.codex]
+executable = "codex"
+# model = "your-installed-model-id"
+# effort = "high"
+# Named profiles are disabled until merged permissions can be verified.
+
+[ai.roles.conversation]
+# backend = "claude"
+
+[ai.roles.design]
+# backend = "claude"
+
+[ai.roles.critic]
+# backend = "codex"
+# effort = "high"
+
+[documents]
+directory = "docs/architecture"
+language = "ko"
