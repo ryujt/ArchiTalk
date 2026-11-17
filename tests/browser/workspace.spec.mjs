@@ -44,7 +44,7 @@ test('real local UI persists a draft, next-run settings and recovery without mod
   const before=await server.workspace();
   expect(before.sessions).toHaveLength(1);
   expect(before.sessions[0].drafts).toHaveLength(0);
-  await page.getByRole('button',{name:'현재 답변으로 초안 만들기',exact:true}).click();
+  await page.getByRole('button',{name:'다음 단계로 · 초안 만들기',exact:true}).click();
   await expect.poll(async()=>{
     const snapshot=await server.workspace();
     return snapshot.runs.some(run=>run.kind==='critic'&&run.status==='completed')&&snapshot.sessions[0].drafts[0]?.reviewed;
@@ -65,6 +65,13 @@ test('real local UI persists a draft, next-run settings and recovery without mod
   expect(exported.status).toBe('completed');expect(exported.result.status).toBe('completed');
   expect(exported.result.paths).toHaveLength(1);
   const bytes=await server.savedFile(exported.result.paths[0]);
+  expect(bytes.startsWith('---\n')).toBe(true);
+  expect(bytes.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)?.[1]).toMatch(/^style:\s*smartmd$/m);
+  for(const language of ['navigation','jobflow','state','layout']){
+    expect(bytes).toMatch(new RegExp('^```'+language+'\\n[\\s\\S]+?\\n```','m'));
+  }
+  expect(bytes).toMatch(/^:::info title="[^"]+"\n[\s\S]+?^:::$/m);
+  expect(bytes).toMatch(/^\{table .+\}\n\n\|.+\|\n\|[ |:-]+\|/m);
   expect(bytes).toContain('# 알림 서비스 아키텍처');
   expect(bytes).toContain('내용 상태: draft');
   expect(saved.sessions[0].content_status).not.toBe('approved');

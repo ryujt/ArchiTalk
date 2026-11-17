@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod app;
 pub mod config;
+pub mod document_format;
 pub mod domain;
 pub mod files;
 pub mod http;

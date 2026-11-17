@@ -816,17 +816,20 @@ impl App {
         tracing::info!(run_id=%l.run_id,role=%kind,phase="ai_start","run phase");
         let spec = l.spec;
         let mut result = ai::generate(spec.clone(), l.cancel.clone(), tx.clone()).await;
-        // Repair schema/quote errors once, never retry transport/auth/model failures.
-        if let Ok(out) = &result {
-            if let Err(error) = validate_output(&l.session, &kind, &out.text) {
-                let mut repair = spec.clone();
-                repair.prompt = format!(
-                    "{}\nYour previous final output failed validation: {}. Return the complete corrected JSON only. Do not change unknown facts.\nPREVIOUS_OUTPUT:\n{}",
-                    repair.prompt,
-                    error,
-                    out.text.chars().take(24_000).collect::<String>()
-                );
-                result = ai::generate(repair, l.cancel.clone(), tx.clone()).await;
+        // Design validation failures must not trigger another paid generation.
+        // Conversation/critic retain their one schema repair.
+        if kind != "design" {
+            if let Ok(out) = &result {
+                if let Err(error) = validate_output(&l.session, &kind, &out.text) {
+                    let mut repair = spec.clone();
+                    repair.prompt = format!(
+                        "{}\nYour previous final output failed validation: {}. Return the complete corrected JSON only. Do not change unknown facts.\nPREVIOUS_OUTPUT:\n{}",
+                        repair.prompt,
+                        error,
+                        out.text.chars().take(24_000).collect::<String>()
+                    );
+                    result = ai::generate(repair, l.cancel.clone(), tx.clone()).await;
+                }
             }
         }
         tracing::info!(run_id=%l.run_id,role=%kind,phase="ai_returned",success=result.is_ok(),"run phase");

@@ -16,5 +16,11 @@
 | 모델·생각 수준 선택 및 직접 입력 조립 | [model-choices-20261118](model-choices-20261118.md) | Node 21건·clippy·format·최신 전역 설치 통과, 독립 검토 완료 |
 | 모델 선택 metadata·안전한 effort 전달 | [model-choices-backend-20261118](model-choices-backend-20261118.md) | 단위 12건·adapter 8건·HTTP/진단 2건 통과, 실제 CLI 1건 ignored |
 | 실제 모델/effort 선택·직접 입력 UI | [model-choices-browser-20261118](model-choices-browser-20261118.md) | desktop/mobile 기존·신규 4건 통과 |
+| Codex 일반 진행 안내 | [codex-progress-20261118](codex-progress-20261118.md) | 진행/오류 판정 기존 계약 통과, 한국어 안내 반영 |
+| 대화 스크롤·인라인 작성·다음 단계·넓은 화면 구현 | [chat-scroll-implementation-20261118](chat-scroll-implementation-20261118.md) | Node 21건·독립 코드 검토 통과 |
+| 실제 긴 대화 스크롤·작성 중 화면·넓은 화면 | [chat-scroll-browser-20261118](chat-scroll-browser-20261118.md) | 수정 전 2실패 보존, 수정 후 desktop/mobile 전체 8건 통과 |
+| SmartMD 문서 생성·형식 계약 | [smartmd-documents-20261118](smartmd-documents-20261118.md) | focused 11건·독립 반례 검토 통과 |
+| 원본 mdview 변환기와 실제 문서 호환 | [smartmd-renderer-20261118](smartmd-renderer-20261118.md) | 대표 문서 6건·실제 Codex 문서의 7블록 변환 통과 |
+| 대화 화면·문서 생성 최종 조립·전역 설치 | [conversation-docs-integration-20261118](conversation-docs-integration-20261118.md) | Rust 80건·브라우저 8건·실제 Codex 설계 1회·전역 설치 통과 |
 
 최초 작업으로 참고할 이전 실행은 없었다. 후속 실행은 각 기록의 미검증·후속 조건을 먼저 확인한다.

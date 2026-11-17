@@ -183,8 +183,9 @@ export function startWorkspace(doc = document, win = window) {
     answer: '', intro: '', cursor: '', feed: null, refreshTimer: null, diagnosticTimer: null,
     contextPaths: new Set(),
     refreshPromise: null, requestEpoch: 0, dialogFocus: null, dialogFocusAction: null,
-    restoreFocus: false, disposed: false
+    restoreFocus: false, dialogScroll: null, runScene: 'interview', disposed: false
   };
+  let renderedScene = null, renderedConversation = null, followConversation = false;
   const dialog = $('scene-dialog');
   const draft = () => list(state.session?.drafts).find(d => d.id === state.selectedDraft) || list(state.session?.drafts).at(-1);
   const approvalIssues = () => draft()?.id === list(state.session?.drafts).at(-1)?.id && Array.isArray(state.session?.readiness_issues) ? state.session.readiness_issues : approvalBlockers(state.session,draft());
@@ -206,12 +207,15 @@ export function startWorkspace(doc = document, win = window) {
   function updateScene({recover = false, keep = false} = {}) {
     if (!state.session) { state.scene = 'welcome'; return; }
     if (state.run?.kind==='diagnostic' && (runIsActive(state.run)||unknownTermination(state.run))) { state.scene='diagnostic'; return; }
-    if (runIsActive(state.run)) { state.scene = 'generating'; return; }
+    if (runIsActive(state.run)) {
+      if (state.scene !== 'generating') state.runScene = state.scene === 'review' && draft() ? 'review' : 'interview';
+      state.scene = 'generating'; return;
+    }
     if (unknownTermination(state.run) || recover) { state.scene = 'recovery'; return; }
     if (keep && ['interview','review','saved'].includes(state.scene)) return;
     if (state.run && ['failed','interrupted'].includes(state.run.status) && state.run.kind!=='diagnostic') { state.scene = 'error'; return; }
     if (state.run?.status === 'cancelled') { state.scene = 'paused'; return; }
-    state.scene = draft() ? 'review' : 'interview';
+    state.scene = state.run?.kind === 'conversation' && ['completed','succeeded'].includes(state.run.status) ? 'interview' : draft() ? 'review' : 'interview';
   }
 
   async function refresh({initial = false, keep = true} = {}) {
@@ -372,6 +376,14 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function render() {
+    let scroll = {left: win.scrollX, top: win.scrollY, behavior: 'instant'};
+    const scene = state.scene === 'generating' ? state.runScene : state.scene;
+    const messages = list(state.session?.messages);
+    const conversation = JSON.stringify([state.session?.id, messages.length, messages.at(-1)?.id, runIsActive(state.run) ? state.run.id : null]);
+    if (scene === 'interview') {
+      if (scene !== renderedScene || conversation !== renderedConversation) followConversation = true;
+    } else followConversation = false;
+    renderedScene = scene; renderedConversation = conversation;
     const workspace = state.workspace;
     $('project-name').textContent = workspace?.project_name || '프로젝트';
     $('sidebar-project').textContent = workspace?.project_name || '프로젝트';
@@ -390,7 +402,7 @@ export function startWorkspace(doc = document, win = window) {
     content.innerHTML = renderStage();
     if (editing) {
       const replacement = $(focused.id);
-      if (replacement) { replacement.focus(); replacement.setSelectionRange(...selection); }
+      if (replacement) { replacement.focus({preventScroll: true}); replacement.setSelectionRange(...selection); }
     }
     renderAux();
     if (state.modal) renderModal();
@@ -398,7 +410,18 @@ export function startWorkspace(doc = document, win = window) {
       state.restoreFocus=false;
       const returnTarget=state.dialogFocus?.isConnected?state.dialogFocus:
         state.dialogFocusAction?doc.querySelector?.(`[data-action="${state.dialogFocusAction}"]`):null;
-      (returnTarget || $('main')).focus();
+      (returnTarget || $('main')).focus({preventScroll: true});
+      if (state.dialogScroll) scroll = state.dialogScroll;
+    }
+    if (followConversation && !state.modal) {
+      // The auxiliary panel can be taller than the conversation. Follow the
+      // composer rather than the bottom of the whole document.
+      $('composer-end')?.scrollIntoView?.({block: 'end', inline: 'nearest', behavior: 'instant'});
+      followConversation = false;
+    } else if (win.scrollX !== scroll.left || win.scrollY !== scroll.top) {
+      // Replacing the stage or restoring focus must not move someone who is
+      // reading older messages during a snapshot or modal update.
+      win.scrollTo?.(scroll);
     }
   }
 
@@ -441,29 +464,34 @@ export function startWorkspace(doc = document, win = window) {
     return `<section class="welcome"><div class="welcome-emblem" aria-hidden="true">✳</div><h1>어떤 서비스를<br>만들고 싶으세요?</h1><p class="intro">목적과 중요한 조건을 하나씩 이야기해 주세요.<br>지금 규모에 맞는 설계를 함께 정리해요.</p><form id="start-form" class="starter-card"><label for="project-intro">프로젝트를 한두 문장으로 소개해 주세요</label><textarea class="starter-input" id="project-intro" name="intro" required maxlength="20000" placeholder="누구를 위한 서비스인지, 어떤 문제를 풀고 싶은지 들려주세요.">${esc(state.intro)}</textarea>${contextChoices()}<div class="starter-footer"><span>아직 정하지 않은 내용은 함께 좁혀 가요.</span><button type="submit" class="primary"${disabled()||!token?' disabled':''}>${state.busy?'준비 중':'대화 시작'} <span aria-hidden="true">→</span></button></div></form><div class="guidance-row"><div class="guidance-card"><span aria-hidden="true">◌</span><h3>한 번에 한 가지씩</h3><p>작게 시작하고, 중요한 선택을 먼저 정리해요.</p></div><div class="guidance-card"><span aria-hidden="true">▤</span><h3>검토한 뒤 문서로</h3><p>초안과 미정을 살펴본 다음 파일에 반영해요.</p></div></div><p class="privacy-note">선택한 로컬 CLI의 기존 로그인을 사용해요. 전체 소스나 인증 정보를 자동으로 전달하지 않아요.</p></section>`;
   }
 
-  function messages() {
-    return `<div class="chat-thread">${list(state.session?.messages).map(message => `<article class="chat-turn ${message.role === 'user'?'user':''}"><div class="avatar ${message.role === 'user'?'user':''}" aria-hidden="true">${message.role === 'user'?'나':'a'}</div><div class="chat-message"><div class="sender">${message.role === 'user'?'나':message.role === 'assistant'?'ArchiTalk':'안내'}<span class="time">${esc(formatTime(message.created_at))}</span></div><pre>${esc(message.content)}</pre></div></article>`).join('')}</div>`;
+  function pendingMessage() {
+    const label = state.run?.status === 'cancelling' ? '도구의 종료를 확인하고 있어요' : ({conversation: '답변 작성 중…', design: '설계 초안 작성 중…', critic: '설계 초안 검토 중…'})[state.run?.kind] || '작업 진행 중…';
+    return `<article class="chat-turn pending-turn" aria-busy="true"><div class="avatar" aria-hidden="true">a</div><div class="chat-message"><div class="sender">ArchiTalk</div><p role="status">${esc(label)}</p><p class="small muted">완료되면 이 자리에 결과를 보여드려요.</p><div class="button-row">${button('cancel',state.run?.status==='cancelling'?'종료 확인 중':'작업 중지','quiet-button',state.busy||state.run?.status==='cancelling')}</div></div></article>`;
   }
 
-  function composer() {
-    return `<form id="answer-form" class="composer"><label for="answer-input" class="sr-only">${draft()?'설계 수정 요청 또는 답변':'답변'}</label><textarea id="answer-input" name="content" required maxlength="20000" placeholder="생각을 들려주세요. 아직 정하지 않았다는 답변도 괜찮아요."${disabled()?' disabled':''}>${esc(state.answer)}</textarea><div class="composer-bottom"><span>Enter로 보내기 · Shift+Enter 줄바꿈</span><button type="submit" class="send-button" aria-label="답변 보내기"${disabled()?' disabled':''}>↑</button></div></form><div class="composer-help"><span>확인된 답변은 대화에 기록돼요.</span>${button('generate',draft()?'현재 답변으로 다시 정리':'현재 답변으로 초안 만들기','quiet-button',disabled())}</div>`;
+  function messages(pending = false) {
+    return `<div class="chat-thread">${list(state.session?.messages).map(message => `<article class="chat-turn ${message.role === 'user'?'user':''}"><div class="avatar ${message.role === 'user'?'user':''}" aria-hidden="true">${message.role === 'user'?'나':'a'}</div><div class="chat-message"><div class="sender">${message.role === 'user'?'나':message.role === 'assistant'?'ArchiTalk':'안내'}<span class="time">${esc(formatTime(message.created_at))}</span></div><pre>${esc(message.content)}</pre></div></article>`).join('')}${pending?pendingMessage():''}</div>`;
   }
 
-  function interview() {
+  function composer(nextStage = false) {
+    const label = nextStage ? draft() ? '다음 단계로 · 초안 다시 정리' : '다음 단계로 · 초안 만들기' : draft() ? '현재 답변으로 다시 정리' : '현재 답변으로 초안 만들기';
+    return `<form id="answer-form" class="composer"><label for="answer-input" class="sr-only">${draft()?'설계 수정 요청 또는 답변':'답변'}</label><textarea id="answer-input" name="content" required maxlength="20000" placeholder="생각을 들려주세요. 아직 정하지 않았다는 답변도 괜찮아요."${disabled()?' disabled':''}>${esc(state.answer)}</textarea><div class="composer-bottom"><span>Enter로 보내기 · Shift+Enter 줄바꿈</span><button type="submit" class="send-button" aria-label="답변 보내기"${disabled()?' disabled':''}>↑</button></div></form><div class="composer-help" id="composer-end"><span>${nextStage?'아직 정하지 않은 조건은 미정으로 남겨요.':'확인된 답변은 대화에 기록돼요.'}</span>${button('generate',label,nextStage?'primary':'quiet-button',disabled())}</div>`;
+  }
+
+  function interview(pending = false) {
     const question=list(state.session?.questions).find(q=>q.id===state.session?.last_question_id && q.status==='pending');
-    return `${messages()}${question?`<div class="question-why">이 질문을 드리는 이유: ${esc(question.reason)}</div>${list(question.options).length?`<div class="quick-answers">${question.options.map(option=>button('quick-answer',esc(option),'quick-answer',disabled(),` data-answer="${esc(option)}"`)).join('')}</div>`:''}`:''}<p class="checkpoint">✓ 서버에 기록된 대화 · 설계 기록 ${esc(state.session?.design_revision)}</p>${draft()?`<div class="inline-notice">${draftIsCurrent(state.session,draft())?'현재 대화 기준 초안이 있어요.':'이전 대화 기준 초안이 있어요. 새 답변은 다시 정리할 때 반영돼요.'} ${button('review','초안 살펴보기','quiet-button')}</div>`:''}${composer()}`;
+    return `${messages(pending)}${question?`<div class="question-why">이 질문을 드리는 이유: ${esc(question.reason)}</div>${list(question.options).length?`<div class="quick-answers">${question.options.map(option=>button('quick-answer',esc(option),'quick-answer',disabled(),` data-answer="${esc(option)}"`)).join('')}</div>`:''}`:''}<p class="checkpoint">✓ 서버에 기록된 대화 · 설계 기록 ${esc(state.session?.design_revision)}</p>${draft()?`<div class="inline-notice">${draftIsCurrent(state.session,draft())?'현재 대화 기준 초안이 있어요.':'이전 대화 기준 초안이 있어요. 새 답변은 다시 정리할 때 반영돼요.'} ${button('review','초안 살펴보기','quiet-button')}</div>`:''}${composer(true)}`;
   }
 
   function generating() {
-    const run = state.run;
-    return `<section class="status-card"><div class="status-icon" aria-hidden="true">✳</div><p class="eyebrow">${run?.kind==='conversation'?'이야기 이어가기':'설계 정리'}</p><h1>${esc(describeStatus(run))}</h1><p>로컬 도구에서 확인된 결과를 기다리고 있어요. 완성된 답변만 대화와 초안에 반영해요.</p>${state.progress?`<p class="status-detail">${esc(state.progress)}</p>`:''}<pre class="live-output" id="live-output">${esc(state.live)}</pre><div class="button-row">${button('cancel',run?.status==='cancelling'?'종료 확인 중':'작업 중지','secondary',state.busy||run?.status==='cancelling')}</div><p class="progress-foot">도구의 종료가 확인될 때까지 새 작업을 시작하지 않아요.</p><details class="status-detail"><summary>이 작업의 설정</summary><pre class="live-output">${esc(JSON.stringify(run?.effective_settings || {},null,2))}</pre></details></section>${draft()?`<div class="inline-notice">마지막으로 완성된 초안은 보존돼 있어요. ${button('inspect-draft','초안 보기','quiet-button')}</div>`:''}`;
+    return state.runScene === 'review' && draft() ? review(true) : interview(true);
   }
 
-  function review() {
+  function review(pending = false) {
     const currentDraft = draft(), current = draftIsCurrent(state.session,currentDraft);
     const approved = currentDraft.content_status === 'approved';
     const issues = approvalIssues();
-    return `<p class="intro">완성된 초안을 살펴보고, 바꾸고 싶은 내용은 대화로 들려주세요.</p><article class="document-preview"><div class="document-toolbar"><span>▤ 아키텍처 설계</span><select class="draft-picker" id="draft-picker" aria-label="초안 버전 선택">${list(state.session.drafts).map((item,i)=>`<option value="${esc(item.id)}"${item.id===currentDraft.id?' selected':''}>초안 ${i+1} · 설계 기록 ${esc(item.input_revision)}</option>`).join('')}</select><span>${approved?'검토본':current?'현재 대화 기준 초안':'이전 대화 기준 초안'}</span></div><div class="document-paper"><p class="doc-label">설계 기록 ${esc(currentDraft.input_revision)} 기준${current?' · 현재 대화와 일치':' · 새 답변 반영 필요'}</p><pre class="markdown">${esc(currentDraft.markdown)}</pre></div></article>${findings()}${issues.length?`<details class="warning-box"><summary>검토본 확정 전에 확인할 내용 · ${issues.length}개</summary><ul>${issues.map(issue=>`<li>${esc(issue)}</li>`).join('')}</ul></details>`:''}<div class="review-actions"><p class="review-note">내용 확정과 파일 저장은 별개예요.<br>${approved?'현재 설계 기록의 내용을 검토본으로 확정했어요.':current?'초안으로 저장하면 가정과 미정을 그대로 남겨요.':'이전 초안을 그대로 저장할 수 있어요. 현재 버전 확정은 다시 정리한 뒤 가능해요.'}</p><div class="button-row">${button('approve',approved?'검토본 확정됨':'이 버전을 검토본으로 확정','secondary',state.busy||approved||!canApprove())}${button('save-preview','문서에 반영 ↗','primary',state.busy||runIsActive(state.run))}</div></div>${composer()}${button('interview','대화 기록 살펴보기','quiet-button')}`;
+    return `<p class="intro">완성된 초안을 살펴보고, 바꾸고 싶은 내용은 대화로 들려주세요.</p><article class="document-preview"><div class="document-toolbar"><span>▤ 아키텍처 설계</span><select class="draft-picker" id="draft-picker" aria-label="초안 버전 선택">${list(state.session.drafts).map((item,i)=>`<option value="${esc(item.id)}"${item.id===currentDraft.id?' selected':''}>초안 ${i+1} · 설계 기록 ${esc(item.input_revision)}</option>`).join('')}</select><span>${approved?'검토본':current?'현재 대화 기준 초안':'이전 대화 기준 초안'}</span></div><div class="document-paper"><p class="doc-label">설계 기록 ${esc(currentDraft.input_revision)} 기준${current?' · 현재 대화와 일치':' · 새 답변 반영 필요'}</p><pre class="markdown">${esc(currentDraft.markdown)}</pre></div></article>${findings()}${issues.length?`<details class="warning-box"><summary>검토본 확정 전에 확인할 내용 · ${issues.length}개</summary><ul>${issues.map(issue=>`<li>${esc(issue)}</li>`).join('')}</ul></details>`:''}<div class="review-actions"><p class="review-note">내용 확정과 파일 저장은 별개예요.<br>${approved?'현재 설계 기록의 내용을 검토본으로 확정했어요.':current?'초안으로 저장하면 가정과 미정을 그대로 남겨요.':'이전 초안을 그대로 저장할 수 있어요. 현재 버전 확정은 다시 정리한 뒤 가능해요.'}</p><div class="button-row">${button('approve',approved?'검토본 확정됨':'이 버전을 검토본으로 확정','secondary',state.busy||approved||!canApprove())}${button('save-preview','문서에 반영 ↗','primary',state.busy||runIsActive(state.run))}</div></div>${pending?pendingMessage():''}${composer()}${button('interview','대화 기록 살펴보기','quiet-button')}`;
   }
 
   function findings() {
@@ -594,6 +622,7 @@ export function startWorkspace(doc = document, win = window) {
   function captureDialogFocus(target) {
     state.dialogFocus=target || doc.activeElement;
     state.dialogFocusAction=state.dialogFocus?.dataset?.action || null;
+    state.dialogScroll={left: win.scrollX, top: win.scrollY, behavior: 'instant'};
   }
 
   async function openSettings(target) {
@@ -672,7 +701,10 @@ export function startWorkspace(doc = document, win = window) {
     if (action==='close-modal') { closeModal(); return; }
     if (action==='toggle-info') { const open=doc.body.classList.toggle('show-info'); target.setAttribute('aria-expanded',String(open)); return; }
     if (action==='interview' || action==='review' || action==='inspect-draft') {
-      state.scene=action==='interview'?'interview':'review'; state.notice=''; render(); return;
+      const scene=action==='interview'?'interview':'review';
+      if (runIsActive(state.run)) { state.runScene=scene; state.scene='generating'; }
+      else state.scene=scene;
+      state.notice=''; render(); return;
     }
     if (action==='quick-answer') {
       if (disabled()) return;

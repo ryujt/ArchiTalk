@@ -303,6 +303,11 @@ fn fixture(dir: &std::path::Path) -> String {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("fixture-cli.py");
     std::fs::write(&path, include_str!("fixtures/claude-workflow.py")).unwrap();
+    std::fs::write(
+        dir.join("architecture.smart.md"),
+        include_str!("fixtures/architecture.smart.md"),
+    )
+    .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     path.to_str().unwrap().into()
 }

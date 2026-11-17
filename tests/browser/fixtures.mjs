@@ -15,6 +15,7 @@ async function startServer() {
   await mkdir(project);await mkdir(tools);
   const executable=join(tools,'fixture-cli.py');
   await copyFile(join(repo,'tests/fixtures/claude-workflow.py'),executable);
+  await copyFile(join(repo,'tests/fixtures/architecture.smart.md'),join(tools,'architecture.smart.md'));
   await chmod(executable,0o700);
   await writeFile(join(project,'README.md'),'# Browser test project\nSynthetic local notification design.\n');
   const config=join(tools,'config.toml');
@@ -45,6 +46,12 @@ async function startServer() {
   }
   return {
     ...endpoint,project,
+    async configureSlowFixture(seconds=2){
+      if(!Number.isFinite(seconds)||seconds<=0||seconds>30)throw new Error('Fixture delay must be between 0 and 30 seconds.');
+      const source=await readFile(executable,'utf8');
+      if(!source.includes('time.sleep(30)'))throw new Error('The isolated slow fixture was already configured or changed.');
+      await writeFile(executable,source.replace('time.sleep(30)',`time.sleep(${seconds})`));
+    },
     async workspace(){
       const response=await fetch(`${endpoint.origin}/api/v1/workspace`,{headers:{Authorization:`Bearer ${endpoint.token}`},redirect:'error'});
       if(!response.ok)throw new Error(`Workspace snapshot returned HTTP ${response.status}.`);

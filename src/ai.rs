@@ -1380,9 +1380,7 @@ impl Parsed {
                             "Code Mode is unavailable because code-mode host is disabled.",
                         ) {
                             Ok(Some(AiEvent::Progress {
-                                message:
-                                    "Codex Code Mode is disabled; text-only generation continues."
-                                        .to_owned(),
+                                message: "Codex가 답변을 생성하고 있어요.".to_owned(),
                             }))
                         } else {
                             Err(AiError::new("cli_failed", "Codex reported an item error."))
