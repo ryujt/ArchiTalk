@@ -14,21 +14,21 @@
 <body>
   <header class="app-header">
     <div class="header-left">
-      <button class="quiet-button sidebar-toggle" id="sidebar-toggle" type="button" data-action="toggle-sidebar" aria-controls="project-sidebar" aria-expanded="true" aria-label="프로젝트 파일"><span aria-hidden="true">☰</span><span class="panel-toggle-label">파일</span></button>
       <a class="brand" href="/" aria-label="ArchiTalk 시작"><span class="brand-mark" aria-hidden="true">a</span>ArchiTalk</a>
       <span class="project-crumb">프로젝트 <b id="project-name">확인 중</b></span>
     </div>
     <div class="header-right">
       <span class="connection" id="connection" role="status"><span class="connection-dot" aria-hidden="true"></span><span>연결 중</span></span>
-      <button class="quiet-button mobile-info" id="info-toggle" type="button" data-action="toggle-info" aria-controls="aux-panel" aria-expanded="true" aria-label="설계 메모"><span aria-hidden="true">▤</span><span class="panel-toggle-label">설계 메모</span></button>
       <button class="quiet-button" type="button" data-action="settings">도구 설정</button>
     </div>
   </header>
   <div class="app-body">
+    <button class="panel-edge-toggle sidebar-toggle" id="sidebar-toggle" type="button" data-action="toggle-sidebar" aria-controls="project-sidebar" aria-expanded="true" aria-label="프로젝트 패널 접기" title="프로젝트 패널 접기"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m10 3-5 5 5 5"/></svg></button>
     <aside class="sidebar" id="project-sidebar" aria-label="프로젝트와 대화">
-      <div><p class="sidebar-title">현재 프로젝트</p><p class="project-title" id="sidebar-project">확인 중</p><span class="local-label">이 폴더에서 시작한 설계</span><div id="session-list" class="session-list"></div><button class="secondary new-session" type="button" data-action="new-session">＋ 새 대화</button></div>
+      <div class="sidebar-project-block"><p class="sidebar-title">현재 프로젝트</p><p class="project-title" id="sidebar-project">확인 중</p><span class="local-label">이 폴더에서 시작한 설계</span><p class="sidebar-section-label">대화 기록</p><div id="session-list" class="session-list"></div><button class="secondary new-session" type="button" data-action="new-session">＋ 새 대화</button></div>
       <nav class="steps" aria-label="설계 단계"><span class="step" id="step-interview"><span class="step-number">1</span>이야기 나누기</span><span class="step" id="step-review"><span class="step-number">2</span>초안 살펴보기</span><span class="step" id="step-save"><span class="step-number">3</span>문서에 반영하기</span></nav>
-      <div class="sidebar-bottom"><div class="file-tree-heading"><h3>프로젝트 파일</h3><button type="button" class="quiet-button" id="file-tree-refresh" aria-label="파일 목록 새로고침">↻</button></div><div id="file-tree" class="file-tree" aria-label="볼 수 있는 파일 목록"><p class="small muted">파일 목록을 확인하고 있어요.</p></div><p class="sidebar-privacy">대화는 로컬에 기록돼요.<br>문서는 반영을 선택할 때 저장해요.</p><p id="root-display" class="mono"></p></div>
+      <section class="sidebar-files" aria-labelledby="file-tree-title"><div class="file-tree-heading"><h3 id="file-tree-title">프로젝트 파일</h3><button type="button" class="quiet-button" id="file-tree-refresh" aria-label="파일 목록 새로고침">↻</button></div><div id="file-tree" class="file-tree" aria-label="볼 수 있는 파일 목록"><p class="small muted">파일 목록을 확인하고 있어요.</p></div></section>
+      <footer class="sidebar-bottom"><p class="sidebar-privacy">대화는 로컬에 기록돼요.<br>문서는 반영을 선택할 때 저장해요.</p><p id="root-display" class="mono"></p></footer>
     </aside>
     <main class="workspace" id="main" tabindex="-1">
       <div class="workspace-top"><div><p class="eyebrow">DESIGN TOGETHER</p><h2 id="workspace-title">프로젝트 설계</h2></div><span class="phase-pill" id="phase">연결 확인</span></div>
@@ -49,6 +49,7 @@
       <div class="aux-tabs" role="tablist" aria-label="참고 정보"><button class="aux-tab active" id="notes-tab" type="button" role="tab" aria-selected="true" aria-controls="aux-content" data-panel="notes">설계 메모</button><button class="aux-tab" id="documents-tab" type="button" role="tab" aria-selected="false" aria-controls="aux-content" tabindex="-1" data-panel="documents">문서</button></div>
       <div id="aux-content" role="tabpanel" aria-labelledby="notes-tab"><p class="context-intro">프로젝트의 기록을 확인하고 있어요.</p></div>
     </aside>
+    <button class="panel-edge-toggle info-toggle" id="info-toggle" type="button" data-action="toggle-info" aria-controls="aux-panel" aria-expanded="true" aria-label="설계 메모 접기" title="설계 메모 접기"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m6 3 5 5-5 5"/></svg></button>
   </div>
   <dialog id="scene-dialog" aria-labelledby="dialog-title"></dialog>
   <div class="sr-only" id="announcer" role="status" aria-live="polite"></div>

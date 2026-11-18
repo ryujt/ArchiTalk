@@ -48,5 +48,6 @@
 | 파일 경계·공용 전사 비밀 설정·음성 API | [viewer-backend](viewer-backend-20261118.md) | HTTP6·local fake transport5·기존 파일/reset21 통과 |
 | 문서 목록 저장 창·탭·녹음·좌우 패널 | [viewer-workspace](viewer-workspace-20261118.md) | 실제 grid 회귀 수정, browser4·Node 표적 통과 |
 | 시스템 구성도·음성 소비자·통합·설치 | [viewer-integration](viewer-integration-20261118.md) | Rust180·Node60·mdview6·browser46 통과, 전역0.4.0 설치 확인 |
+| 전체 화면 디자인·단계 아래 파일 목록·양쪽 경계 제어 | [workspace-redesign](workspace-redesign-20261118.md) · [구현](sidebar-placement-implementation-20261118.md) | Node60·browser50·fmt/clippy/release 통과,0.5.0 배포 확인 |
 
 최초 작업으로 참고할 이전 실행은 없었다. 후속 실행은 각 기록의 미검증·후속 조건을 먼저 확인한다.

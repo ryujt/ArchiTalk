@@ -557,10 +557,15 @@ export function startWorkspace(doc = document, win = window) {
   function renderPanels() {
     doc.body.classList.toggle('left-panel-collapsed',state.leftCollapsed);
     doc.body.classList.toggle('right-panel-collapsed',state.rightCollapsed);
-    $('sidebar-toggle')?.setAttribute('aria-expanded',String(!state.leftCollapsed));
-    $('sidebar-toggle')?.setAttribute('title',state.leftCollapsed?'프로젝트 패널 펼치기':'프로젝트 패널 접기');
-    $('info-toggle')?.setAttribute('aria-expanded',String(!state.rightCollapsed));
-    $('info-toggle')?.setAttribute('title',state.rightCollapsed?'설계 메모 펼치기':'설계 메모 접기');
+    for (const [id, collapsed, label] of [
+      ['sidebar-toggle',state.leftCollapsed,'프로젝트 패널'],
+      ['info-toggle',state.rightCollapsed,'설계 메모']
+    ]) {
+      const control=$(id), action=`${label} ${collapsed?'펼치기':'접기'}`;
+      control?.setAttribute('aria-expanded',String(!collapsed));
+      control?.setAttribute('title',action);
+      control?.setAttribute('aria-label',action);
+    }
   }
 
   function renderDocumentPreview(content) {

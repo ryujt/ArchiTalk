@@ -127,7 +127,7 @@ test('real local UI persists a draft, next-run settings and recovery without mod
   await page.getByRole('button',{name:'초안 먼저 살펴보기',exact:true}).click();
   await expect(page.locator('.markdown').getByRole('heading',{name:'알림 서비스 아키텍처',exact:true})).toBeVisible();
   if(mobile){
-    await page.getByRole('button',{name:'설계 메모',exact:true}).click();
+    await page.locator('#info-toggle').click();
     await expect(page.locator('#aux-panel')).toBeVisible();await noOverflow(page);
     await page.setViewportSize({width:768,height:1024});
     await expect(page.locator('#session-switcher')).toBeVisible();
