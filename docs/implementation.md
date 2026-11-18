@@ -1,4 +1,4 @@
-# ArchiTalk 0.5 구현 안내
+# ArchiTalk 0.6 구현 안내
 
 기준 설계는 [2026-11-17 TO-BE](design/20261117-190055/to-be/system-design-to-be.md)다. 설계 문서는 당시의 목표와 대안을 보존하고, 이 문서와 [README](../README.md)는 실제 제품 계약과 검증 범위를 설명한다.
 
@@ -45,9 +45,9 @@ DB schema는 3이다. v1/v2에서 이행하기 전에 SQLite online backup으로
 | `POST /settings/diagnostics` | 모델 호출 없는 설치·버전·필수 옵션 진단 |
 | `GET /files/tree` | 보기 가능한 재귀 `entries`와 평면 `files`, 잘림 여부·프로젝트 표시 경로. Markdown/지원 텍스트만,2MiB/파일·2000파일·깊이12 등 탐색 예산 적용 |
 | `GET /files/read?path=...` | `{path,name,kind,content,size,hash,absolute_path}`. 고정 프로젝트 경계·허용 이름·UTF-8·크기·no-follow 재검사 |
-| `GET /transcription/settings` | `{configured,model,max_audio_bytes,timeout_seconds,key_source}`. 원문 키는 반환하지 않음 |
+| `GET /transcription/settings` | `{configured,model,timing_supported,max_audio_bytes,timeout_seconds,key_source}`. 원문 키는 반환하지 않음 |
 | `PATCH /transcription/key` | 직접 `{api_key?,model?}`. 키 생략은 유지, null/빈 문자열은 삭제. 공용 비밀 파일만 갱신 |
-| `POST /transcription` | `audio` 한 필드의 multipart. `{text,model}` 반환.20MiB/120초, 동시1개, 자동 retry 없음 |
+| `POST /transcription` | `audio` 한 필드의 multipart. `{text,model,segments:[{start,end,text}],timing:"segment"|"none"}` 반환. start/end는 초.20MiB/120초, 동시1개, 자동 retry 없음 |
 
 `202`는 접수이며 생성 완료가 아니다. SSE delta는 임시 데이터이고 마지막 확정 snapshot이 기준이다. feed를 놓치면 cursor replay 또는 snapshot polling으로 복구한다. UI는 불명확한 저장 응답을 같은 export ID로 조회해 확인하고 새로운 저장을 겹치지 않는다.
 
@@ -57,9 +57,9 @@ DB schema는 3이다. v1/v2에서 이행하기 전에 SQLite online backup으로
 
 파일 트리·중복 없는 문서 탭·각 읽기 위치·채팅 탭과 우클릭 복사 메뉴는 페이지 메모리에서 관리한다. 프로젝트 파일 목록은 단계 안내 바로 아래에 두고 개인정보 안내·경로 footer와 분리한다. 좌우 제어는 header 메뉴 대신 각 패널의 안쪽 경계에 둔다. 접은 뒤에도 복원 버튼을 화면 가장자리에 남기고 패널 overflow/숨김과 분리한다. 공통 색·글자·간격을 시작/대화/문서/설정 화면에 적용하며 overlay와 고정 도구의 포커스 겹침을 실제 브라우저로 확인한다. 패널 크기가 바뀌면 도표도 재맞춤하며 확대·이동에 내부 스크롤바를 사용하지 않는다. 전체 저장 modal은 파일 목록만 기본으로 표시하고 원문은 접힌 details에 둔다. header/body/footer를 나누어 긴 원문이 저장 버튼을 밀어내지 않는다.
 
-녹음은 설정의 키 존재를 확인한 뒤에만 마이크 권한을 요청한다. 녹음 중 문서 열기·클릭·선택·복사를 파일/제목/경과시간과 함께 메모리에 기록한다. 종료 후에는 음성만 고정 OpenAI Audio API로 전송하고 전사와 문서 위치 기록을 브라우저에서 결합하여 클립보드에 쓴다. 클립보드 거부 시 수동 복사 결과를 표시한다. 문서 수정이나 AI 작업을 자동 실행하지 않는다. 페이지 종료·프로젝트 reset 때 마이크 track·파일 요청·전사 요청을 중단하고 지연 결과를 무시한다. 오디오·전사·위치 기록의 디스크 보관은 없다.
+녹음은 설정의 키 존재를 확인한 뒤에만 마이크 권한을 요청한다. MediaRecorder의 실제 start 이벤트를 공통0으로 두고 녹음 중 문서 열기·클릭·선택·복사를 파일/제목/경과시간과 함께 메모리에 기록한다. stop 시각·조작 배열을 즉시 동결하고 지연 start/timer/stop/upload callback은 세대와 phase를 검사한다. 종료 후에는 음성만 고정 OpenAI Audio API로 전송하고 실제 발화 구간의 초를 안전한 정수 ms로 바꾸어 문서 조작과 stable sort한다. 같은 시작 시각은 발화가 먼저이고 같은 종류/시각의 원래 순서는 유지한다. open/focus/selection·word/copy를 open/click/select/copy로 표현하고 파일·앵커·선택 text·줄/offset을 보존한다. 통합 Markdown 타임라인을 클립보드에 쓴다. 시간 없는 응답은 untimedSpeech로 분리하고 전사 길이로 시각을 추정하지 않는다. 정렬된 발화와 전체 원문이 NFC/공백 정리 후 일치하지 않으면 전체 원문도 별도 포함한다. 클립보드 거부 시 수동 복사 결과를 표시한다. 문서 수정이나 AI 작업을 자동 실행하지 않는다. 페이지 종료·프로젝트 reset 때 마이크 track·파일 요청·전사 요청을 중단하고 지연 결과를 무시한다. 오디오·전사·위치 기록의 디스크 보관은 없다.
 
-키와 전사 모델은 공용 config의 형제 파일 `transcription-secrets.toml`에 별도로 보관한다. 권한0600·소유자·no-follow를 확인하고 atomic 교체하며 일반 `Settings`의 Serialize/Debug·프로젝트 snapshot·receipt에 넣지 않는다. 환경변수 `OPENAI_API_KEY`는 파일 키가 없을 때 대체로 사용할 수 있다. 파일 키를 삭제해도 환경변수 키가 있으면 `configured:true,key_source:environment`로 표시한다. 격리 `App::open`은 실제 공용 파일과 환경 키를 읽지 않는다. 기본 전사 모델은 `gpt-transcribe`이며 UI는 녹음 종료 후 명시적으로 POST 요청을 보내며 이때 원격 API를 호출한다. 연결10초·전체120초·응답1MiB·오디오20MiB 제한, redirect/자동 retry 금지와 reset/shutdown 취소를 적용한다. [공식 API](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create)를 기준으로 음성의 실제 MIME/컨테이너를 검사한다.
+키와 전사 모델은 공용 config의 형제 파일 `transcription-secrets.toml`에 별도로 보관한다. 권한0600·소유자·no-follow를 확인하고 atomic 교체하며 일반 `Settings`의 Serialize/Debug·프로젝트 snapshot·receipt에 넣지 않는다. 환경변수 `OPENAI_API_KEY`는 파일 키가 없을 때 대체로 사용할 수 있다. 파일 키를 삭제해도 환경변수 키가 있으면 `configured:true,key_source:environment`로 표시한다. 격리 `App::open`은 실제 공용 파일과 환경 키를 읽지 않는다. 기본 전사 모델은 `whisper-1`이며 기존 비밀 설정 파일에 명시된 모델은 유지한다. Whisper는 verbose_json/segment 시간 정보를 요청하고 다른 모델은 json만 요청한다. Settings의 timing_supported는 알려진 whisper-1 프로필에만 true다. 응답 segments가 누락/null/빈 배열이면 timing:none이며, 실제 Whisper 구간이 있으면 timing:segment다. malformed 구간·음수/역전/비유한/안전 ms 상한 초과·NUL·4096개 초과는 원문 노출 없는 고정 오류로 거절한다. 다른 모델의 시간 정보를 임의 구간으로 변환하지 않는다. UI는 녹음 종료 후 명시적으로 POST 요청을 보내며 이때 원격 API를 호출한다. 연결10초·전체120초·응답1MiB·오디오20MiB 제한, redirect/자동 retry 금지와 reset/shutdown 취소를 적용한다. [공식 API](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create)를 기준으로 음성의 실제 MIME/컨테이너를 검사한다.
 
 ## 대화·검토·저장
 

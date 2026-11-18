@@ -16,10 +16,13 @@ pub const MAX_AUDIO_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_REQUEST_BYTES: usize = MAX_AUDIO_BYTES + 64 * 1024;
 pub const TIMEOUT_SECONDS: u64 = 120;
 const ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
-const DEFAULT_MODEL: &str = "gpt-transcribe";
+const DEFAULT_MODEL: &str = "whisper-1";
 const SECRET_NAME: &str = "transcription-secrets.toml";
 const MAX_SECRET_BYTES: usize = 16 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_SEGMENTS: usize = 4096;
+// The browser converts seconds to milliseconds and stores safe JS integers.
+const MAX_SEGMENT_SECONDS: f64 = 9_007_199_254_740_991.0 / 1000.0;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -40,6 +43,7 @@ fn settings_error(_: impl std::fmt::Display) -> Error {
 pub struct Settings {
     pub configured: bool,
     pub model: String,
+    pub timing_supported: bool,
     pub max_audio_bytes: usize,
     pub timeout_seconds: u64,
     pub key_source: &'static str,
@@ -77,6 +81,29 @@ pub struct Job {
 pub struct Transcript {
     pub text: String,
     pub model: String,
+    pub segments: Vec<Segment>,
+    pub timing: Timing,
+}
+#[derive(Serialize, Deserialize)]
+pub struct Segment {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Timing {
+    Segment,
+    None,
+}
+fn timing_supported(model: &str) -> bool {
+    model == "whisper-1"
+}
+fn response_error() -> Error {
+    error(
+        "transcription_response_invalid",
+        "전사 응답을 읽을 수 없습니다.",
+    )
 }
 
 impl Service {
@@ -97,6 +124,7 @@ impl Service {
         let credentials = self.credentials()?;
         Ok(Settings {
             configured: !credentials.key.is_empty(),
+            timing_supported: timing_supported(&credentials.model),
             model: credentials.model,
             max_audio_bytes: MAX_AUDIO_BYTES,
             timeout_seconds: TIMEOUT_SECONDS,
@@ -245,9 +273,21 @@ impl Service {
             .file_name(format!("recording.{extension}"))
             .mime_str(mime.split(';').next().unwrap_or(mime))
             .map_err(|_| error("invalid_audio", "지원되는 오디오 형식을 사용하세요."))?;
-        let form = multipart::Form::new()
+        let supports_timing = timing_supported(&model);
+        let mut form = multipart::Form::new()
             .text("model", model.clone())
+            .text(
+                "response_format",
+                if supports_timing {
+                    "verbose_json"
+                } else {
+                    "json"
+                },
+            )
             .part("file", part);
+        if supports_timing {
+            form = form.text("timestamp_granularities[]", "segment");
+        }
         let mut authorization =
             reqwest::header::HeaderValue::from_str(&format!("Bearer {}", job.credentials.key))
                 .map_err(|_| {
@@ -295,21 +335,43 @@ impl Service {
         struct Response {
             text: String,
         }
-        let parsed: Response = serde_json::from_slice(&bytes).map_err(|_| {
-            error(
-                "transcription_response_invalid",
-                "전사 응답을 읽을 수 없습니다.",
-            )
-        })?;
-        if parsed.text.contains('\0') {
-            return Err(error(
-                "transcription_response_invalid",
-                "전사 응답을 읽을 수 없습니다.",
-            ));
+        #[derive(Deserialize)]
+        struct SegmentResponse {
+            text: String,
+            #[serde(default)]
+            segments: Option<Vec<Segment>>,
+        }
+        let (text, segments) = if supports_timing {
+            let parsed: SegmentResponse =
+                serde_json::from_slice(&bytes).map_err(|_| response_error())?;
+            (parsed.text, parsed.segments.unwrap_or_default())
+        } else {
+            let parsed: Response = serde_json::from_slice(&bytes).map_err(|_| response_error())?;
+            (parsed.text, Vec::new())
+        };
+        if text.contains('\0')
+            || segments.len() > MAX_SEGMENTS
+            || segments.iter().any(|segment| {
+                !segment.start.is_finite()
+                    || !segment.end.is_finite()
+                    || segment.start < 0.0
+                    || segment.end < segment.start
+                    || segment.start > MAX_SEGMENT_SECONDS
+                    || segment.end > MAX_SEGMENT_SECONDS
+                    || segment.text.contains('\0')
+            })
+        {
+            return Err(response_error());
         }
         Ok(Transcript {
-            text: parsed.text,
+            text,
             model,
+            timing: if segments.is_empty() {
+                Timing::None
+            } else {
+                Timing::Segment
+            },
+            segments,
         })
     }
 }
@@ -564,10 +626,13 @@ mod tests {
         (endpoint, state, task)
     }
     fn service_job(service: &Service) -> Job {
+        service_job_for_model(service, DEFAULT_MODEL)
+    }
+    fn service_job_for_model(service: &Service, model: &str) -> Job {
         Job {
             credentials: Credentials {
                 key: "synthetic-unit-key".into(),
-                model: DEFAULT_MODEL.into(),
+                model: model.into(),
                 source: "none",
             },
             _permit: service.gate.clone().try_acquire_owned().unwrap(),
@@ -577,11 +642,15 @@ mod tests {
         vec![0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0]
     }
     #[tokio::test]
-    async fn fake_upstream_receives_only_audio_and_model_and_text_is_returned_without_fake_segments()
-     {
+    async fn whisper_requests_real_segments_and_returns_them_without_inventing_or_sorting_times() {
+        let expected_segments = serde_json::json!([
+            {"start":2.25,"end":4.5,"text":"두 번째"},
+            {"start":0.125,"end":3.0,"text":"첫 번째"},
+            {"start":4.5,"end":4.5,"text":""}
+        ]);
         let (endpoint, state, task) = upstream(
             StatusCode::OK,
-            "{\"text\":\"전사 결과\",\"languages\":[{\"code\":\"ko\"}]}".into(),
+            serde_json::json!({"text":"전사 결과","segments":expected_segments,"languages":[{"code":"ko"}]}).to_string(),
             Duration::ZERO,
         )
         .await;
@@ -596,17 +665,156 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.text, "전사 결과");
-        assert_eq!(result.model, DEFAULT_MODEL);
-        let wire = state.body.lock().unwrap().clone();
-        let wire = String::from_utf8_lossy(&wire);
-        assert!(wire.contains("name=\"model\"\r\n\r\ngpt-transcribe"));
-        assert!(wire.contains("name=\"file\"; filename=\"recording.webm\""));
-        assert_eq!(wire.matches("Content-Disposition:").count(), 2);
-        assert!(!wire.contains("events"));
-        assert!(!wire.contains("synthetic-unit-key"));
+        assert_eq!(result.model, "whisper-1");
+        let result = serde_json::to_value(result).unwrap();
+        assert_eq!(result["segments"], expected_segments);
+        assert_eq!(result["timing"], "segment");
+        assert_form_fields(&state, "whisper-1", true);
         assert_eq!(state.calls.load(Ordering::SeqCst), 1);
         assert!(service.gate.clone().try_acquire_owned().is_ok());
         task.abort();
+    }
+    fn assert_form_fields(state: &Fake, model: &str, timed: bool) {
+        let body = state.body.lock().unwrap();
+        let wire = String::from_utf8_lossy(&body);
+        let mut names = wire
+            .split("Content-Disposition: form-data; name=\"")
+            .skip(1)
+            .map(|part| part.split('"').next().unwrap())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        let expected = if timed {
+            vec![
+                "file",
+                "model",
+                "response_format",
+                "timestamp_granularities[]",
+            ]
+        } else {
+            vec!["file", "model", "response_format"]
+        };
+        assert_eq!(names, expected);
+        assert_eq!(wire.matches("Content-Disposition:").count(), expected.len());
+        assert!(wire.contains(&format!("name=\"model\"\r\n\r\n{model}\r\n")));
+        assert!(wire.contains(
+            "name=\"file\"; filename=\"recording.webm\"\r\nContent-Type: audio/webm\r\n"
+        ));
+        let format = if timed { "verbose_json" } else { "json" };
+        assert!(wire.contains(&format!("name=\"response_format\"\r\n\r\n{format}\r\n")));
+        if timed {
+            assert!(wire.contains("name=\"timestamp_granularities[]\"\r\n\r\nsegment\r\n"));
+        }
+        assert!(!wire.contains("events"));
+        assert!(!wire.contains("synthetic-unit-key"));
+    }
+    #[tokio::test]
+    async fn other_model_profiles_request_json_and_never_claim_timestamps() {
+        for model in ["gpt-transcribe", "gpt-4o-transcribe", "whisper-1-custom"] {
+            for segments in [
+                serde_json::json!([{"start":0.25,"end":1.0,"text":"not a supported timing profile"}]),
+                serde_json::json!("unrelated upstream field"),
+            ] {
+                let (endpoint, state, task) = upstream(
+                    StatusCode::OK,
+                    serde_json::json!({"text":"전체 전사문","segments":segments}).to_string(),
+                    Duration::ZERO,
+                )
+                .await;
+                let service = Service::new(None).unwrap();
+                let result = service
+                    .send(
+                        service_job_for_model(&service, model),
+                        webm(),
+                        "audio/webm",
+                        &endpoint,
+                    )
+                    .await
+                    .unwrap();
+                let result = serde_json::to_value(result).unwrap();
+                assert_eq!(
+                    result,
+                    serde_json::json!({"text":"전체 전사문","model":model,"segments":[],"timing":"none"})
+                );
+                assert_form_fields(&state, model, false);
+                assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+                task.abort();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn absent_null_or_empty_whisper_segments_remain_explicitly_untimed() {
+        for response in [
+            serde_json::json!({"text":"전체 전사문"}),
+            serde_json::json!({"text":"전체 전사문","segments":null}),
+            serde_json::json!({"text":"전체 전사문","segments":[]}),
+        ] {
+            let (endpoint, _, task) =
+                upstream(StatusCode::OK, response.to_string(), Duration::ZERO).await;
+            let service = Service::new(None).unwrap();
+            let result = service
+                .send(service_job(&service), webm(), "audio/webm", &endpoint)
+                .await
+                .unwrap();
+            let result = serde_json::to_value(result).unwrap();
+            assert_eq!(result["segments"], serde_json::json!([]));
+            assert_eq!(result["timing"], "none");
+            task.abort();
+        }
+    }
+    #[tokio::test]
+    async fn whisper_accepts_segment_count_and_safe_millisecond_time_boundaries() {
+        let latest = 9_007_199_254_740_991.0_f64 / 1000.0;
+        let segments =
+            vec![serde_json::json!({"start":latest,"end":latest,"text":"boundary"}); 4096];
+        let (endpoint, _, task) = upstream(
+            StatusCode::OK,
+            serde_json::json!({"text":"boundary","segments":segments}).to_string(),
+            Duration::ZERO,
+        )
+        .await;
+        let service = Service::new(None).unwrap();
+        let result = service
+            .send(service_job(&service), webm(), "audio/webm", &endpoint)
+            .await
+            .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        assert_eq!(result["segments"].as_array().unwrap().len(), 4096);
+        assert_eq!(result["segments"][0]["end"], latest);
+        assert_eq!(result["timing"], "segment");
+        task.abort();
+    }
+    #[tokio::test]
+    async fn malformed_whisper_timestamps_fail_closed_without_echoing_upstream_content() {
+        let mut responses = vec![
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":"wrong type"}),
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":{}}),
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":[null]}),
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":[{}]}),
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":[{"start":"0","end":1,"text":"x"}]}),
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":[{"start":0,"end":1,"text":null}]}),
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":[{"start":0,"end":1,"text":"x\0y"}]}),
+            serde_json::json!({"text":"synthetic\0upstream-secret","segments":[]}),
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":[{"start":-0.1,"end":1,"text":"x"}]}),
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":[{"start":0,"end":-1,"text":"x"}]}),
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":[{"start":2,"end":1,"text":"x"}]}),
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":[{"start":0,"end":9_007_199_254_741.0_f64,"text":"x"}]}),
+            serde_json::json!({"text":"synthetic-upstream-secret","segments":vec![serde_json::json!({"start":0,"end":1,"text":"x"});4097]}),
+        ].into_iter().map(|value| value.to_string()).collect::<Vec<_>>();
+        responses.push("{\"text\":\"synthetic-upstream-secret\",\"segments\":[{\"start\":0,\"end\":1e309,\"text\":\"x\"}]}".into());
+        for response in responses {
+            let (endpoint, state, task) = upstream(StatusCode::OK, response, Duration::ZERO).await;
+            let service = Service::new(None).unwrap();
+            let failure = service
+                .send(service_job(&service), webm(), "audio/webm", &endpoint)
+                .await
+                .err()
+                .expect("malformed timing must fail");
+            assert_eq!(failure.code, "transcription_response_invalid");
+            assert!(!format!("{failure:?} {failure}").contains("synthetic"));
+            assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+            assert!(service.gate.clone().try_acquire_owned().is_ok());
+            task.abort();
+        }
     }
     #[tokio::test]
     async fn redirects_and_upstream_error_bodies_are_redacted_and_never_retried() {
@@ -713,6 +921,11 @@ mod tests {
         let service = Service::new(None).unwrap();
         let settings = service.settings().unwrap();
         assert!(!settings.configured);
+        assert_eq!(settings.model, "whisper-1");
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["timing_supported"],
+            true
+        );
         assert_eq!(settings.key_source, "none");
         assert_eq!(settings.max_audio_bytes, 20 * 1024 * 1024);
         assert_eq!(settings.timeout_seconds, 120);

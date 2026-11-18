@@ -155,6 +155,8 @@ async fn transcription_secrets_are_write_only_shared_private_and_explicitly_remo
     let settings = value(response).await;
     assert_eq!(settings["configured"], true);
     assert_eq!(settings["key_source"], "file");
+    assert_eq!(settings["model"], "gpt-transcribe");
+    assert_eq!(settings["timing_supported"], false);
     assert!(!settings.to_string().contains(secret));
     let secret_file = config.path().join("transcription-secrets.toml");
     assert_eq!(
@@ -176,7 +178,10 @@ async fn transcription_secrets_are_write_only_shared_private_and_explicitly_remo
         ))
         .await
         .unwrap();
-    assert_eq!(value(response).await["configured"], true);
+    let settings = value(response).await;
+    assert_eq!(settings["configured"], true);
+    assert_eq!(settings["model"], "gpt-transcribe");
+    assert_eq!(settings["timing_supported"], false);
     let response = api
         .clone()
         .oneshot(request(
@@ -198,7 +203,38 @@ async fn transcription_secrets_are_write_only_shared_private_and_explicitly_remo
         ))
         .await
         .unwrap();
-    assert_eq!(value(response).await["configured"], false);
+    let settings = value(response).await;
+    assert_eq!(settings["configured"], false);
+    assert_eq!(settings["model"], "whisper-1");
+    assert_eq!(settings["timing_supported"], true);
+}
+
+#[tokio::test]
+async fn existing_explicit_transcription_model_survives_key_only_updates_and_restart() {
+    let project = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let config_file = config.path().join("config.toml");
+    let secret_file = config.path().join("transcription-secrets.toml");
+    fs::write(&secret_file, "model='gpt-transcribe'\n").unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let app = App::open_with_shared_config(project.path(), &config_file).unwrap();
+    let settings = serde_json::to_value(app.transcription_settings().unwrap()).unwrap();
+    assert_eq!(settings["model"], "gpt-transcribe");
+    assert_eq!(settings["timing_supported"], false);
+    app.update_transcription(&json!({"api_key":"synthetic-key-only-update"}))
+        .unwrap();
+    drop(app);
+    let reopened = App::open_with_shared_config(project.path(), &config_file).unwrap();
+    let settings = serde_json::to_value(reopened.transcription_settings().unwrap()).unwrap();
+    assert_eq!(settings["model"], "gpt-transcribe");
+    assert_eq!(settings["timing_supported"], false);
+    let settings = serde_json::to_value(
+        reopened
+            .update_transcription(&json!({"model":"whisper-1"}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(settings["timing_supported"], true);
 }
 
 #[tokio::test]
