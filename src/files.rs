@@ -2,6 +2,7 @@
 //!
 //! `reserve` must be persisted by the controller before `apply`. A directory
 //! without a persisted identity is deliberately never adopted after a crash.
+use crate::design_package::{DesignDocument, MAIN_FILENAME};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -141,24 +142,22 @@ impl Directory {
             .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
         Ok(())
     }
-    pub(crate) fn backup_file(&self, name: &str, source: &File) -> Result<()> {
+    pub(crate) fn create_private_file(&self, name: &str) -> Result<File> {
         let name_c = Self::name(name)?;
         let fd = unsafe {
             libc::openat(
                 self.file.as_raw_fd(),
                 name_c.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0o600,
             )
         };
         if fd < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        let mut output = unsafe { File::from_raw_fd(fd) };
-        std::io::copy(&mut source.try_clone()?, &mut output)?;
-        output.sync_all()?;
+        let output = unsafe { File::from_raw_fd(fd) };
         self.sync()?;
-        Ok(())
+        Ok(output)
     }
     pub(crate) fn sync(&self) -> Result<()> {
         self.file.sync_all()?;
@@ -425,11 +424,32 @@ impl ProjectFiles {
         document_revision: u64,
         session_id: &str,
     ) -> Result<ExportPlan> {
+        self.preview_documents_in(
+            base_directory,
+            title,
+            markdown,
+            &[],
+            document_revision,
+            session_id,
+        )
+    }
+    /// Build one immutable bundle. Artifact kinds, rather than model paths,
+    /// determine filenames; a legacy draft supplies an empty document slice.
+    pub fn preview_documents_in(
+        &self,
+        base_directory: &str,
+        title: &str,
+        markdown: &str,
+        documents: &[DesignDocument],
+        document_revision: u64,
+        session_id: &str,
+    ) -> Result<ExportPlan> {
         preview_in_at(
             &self.root,
             base_directory,
             title,
             markdown,
+            documents,
             document_revision,
             session_id,
         )
@@ -478,11 +498,30 @@ pub fn preview_in(
         session_id,
     )
 }
+pub fn preview_documents_in(
+    root: &Path,
+    base_directory: &str,
+    title: &str,
+    markdown: &str,
+    documents: &[DesignDocument],
+    document_revision: u64,
+    session_id: &str,
+) -> Result<ExportPlan> {
+    ProjectFiles::open(root)?.preview_documents_in(
+        base_directory,
+        title,
+        markdown,
+        documents,
+        document_revision,
+        session_id,
+    )
+}
 fn preview_in_at(
     root_dir: &Directory,
     base_directory: &str,
     title: &str,
     markdown: &str,
+    documents: &[DesignDocument],
     document_revision: u64,
     session_id: &str,
 ) -> Result<ExportPlan> {
@@ -525,20 +564,30 @@ fn preview_in_at(
         suffix += 1;
     };
     validate_relative_path(&relative_directory)?;
-    Ok(ExportPlan {
+    let mut files = vec![ExportFile {
+        relative_path: MAIN_FILENAME.to_owned(),
+        content: markdown.to_owned(),
+        hash: hash_bytes(markdown.as_bytes()),
+    }];
+    let mut ordered: Vec<_> = documents.iter().collect();
+    ordered.sort_by_key(|document| document.kind);
+    files.extend(ordered.into_iter().map(|document| ExportFile {
+        relative_path: document.kind.filename().to_owned(),
+        content: document.markdown.clone(),
+        hash: hash_bytes(document.markdown.as_bytes()),
+    }));
+    let plan = ExportPlan {
         id: uuid::Uuid::new_v4().to_string(),
         document_revision,
         document_hash: hash_bytes(markdown.as_bytes()),
         session_id: session_id.to_owned(),
         title: title.to_owned(),
         relative_directory,
-        files: vec![ExportFile {
-            relative_path: "아키텍처-설계.md".to_owned(),
-            content: markdown.to_owned(),
-            hash: hash_bytes(markdown.as_bytes()),
-        }],
+        files,
         bundle_identity: None,
-    })
+    };
+    validate_plan(&plan)?;
+    Ok(plan)
 }
 fn validate_plan(plan: &ExportPlan) -> Result<Vec<String>> {
     let parts = validate_relative_path(&plan.relative_directory)?;

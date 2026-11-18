@@ -11,9 +11,42 @@ fn invalid(detail: &str) -> anyhow::Error {
     anyhow::anyhow!("architecture document format: {detail}")
 }
 
-/// Check observable structure and the conservative DSL subset documented in
-/// RULES. This is not a proof of project semantics or visual rendering quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagramKind {
+    Navigation,
+    Jobflow,
+    State,
+    Layout,
+}
+
+impl DiagramKind {
+    fn index(self) -> usize {
+        match self {
+            Self::Navigation => 0,
+            Self::Jobflow => 1,
+            Self::State => 2,
+            Self::Layout => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationProfile {
+    /// The historical single-document generation contract remains available.
+    Legacy,
+    Principal,
+    Supporting,
+    Diagram(DiagramKind),
+}
+
+/// Preserve the legacy contract for callers and archived-output tests.
 pub fn validate(markdown: &str) -> Result<()> {
+    validate_profile(markdown, ValidationProfile::Legacy)
+}
+
+/// Shared SmartMD and conservative DSL validation. Profiles require diagrams
+/// only where they belong; semantic architecture quality is reviewed separately.
+pub fn validate_profile(markdown: &str, profile: ValidationProfile) -> Result<()> {
     if !markdown.starts_with("---\n") {
         return Err(invalid("SmartMD frontmatter must start at the first byte"));
     }
@@ -47,10 +80,30 @@ pub fn validate(markdown: &str) -> Result<()> {
         ));
     }
 
+    if profile != ValidationProfile::Legacy {
+        for key in ["title", "locale", "style"] {
+            if lines[1..end]
+                .iter()
+                .filter(|line| line.starts_with(&format!("{key}:")))
+                .count()
+                != 1
+                || fields.get(key).is_some_and(|value| {
+                    value.starts_with(['[', '{', '|', '>']) || ["null", "~"].contains(value)
+                })
+            {
+                return Err(invalid(
+                    "required frontmatter fields must be unique nonempty scalars",
+                ));
+            }
+        }
+    }
+
     let mut headings = [false; 4];
     let mut blocks = [0; 4];
     let mut prose: [Vec<&str>; 4] = std::array::from_fn(|_| Vec::new());
     let mut section = None;
+    let mut active_h2 = None;
+    let mut method_r_blocks = [0; 2];
     let mut callout: Option<(bool, bool)> = None;
     let mut has_callout = false;
     let mut has_table = false;
@@ -70,47 +123,59 @@ pub fn validate(markdown: &str) -> Result<()> {
                         "dedicated DSL fences must start at column zero with language immediately after the marker",
                     ));
                 }
-                if section != Some(which) || callout.is_some() {
+                let method_r = profile == ValidationProfile::Principal
+                    && which == 1
+                    && active_h2.is_some_and(|heading| {
+                        [
+                            "Method-R macro design",
+                            "Method-R system design",
+                            "Method-R module design",
+                            "Method-R detailed design",
+                        ]
+                        .contains(&heading)
+                    });
+                if (section != Some(which) && !method_r) || callout.is_some() {
                     return Err(invalid(
                         "dedicated DSL must be in its own design section, outside callouts",
                     ));
                 }
+                if method_r {
+                    let header = match active_h2 {
+                        Some("Method-R macro design") => Some("scope:"),
+                        Some("Method-R module design") => Some("orchestrator:"),
+                        _ => None,
+                    };
+                    if header.is_some_and(|header| {
+                        !lines[start..i].iter().any(|line| line.starts_with(header))
+                    }) {
+                        return Err(invalid(
+                            "Method-R macro uses scope: and module uses orchestrator:",
+                        ));
+                    }
+                }
                 validate_dsl(which, &lines[start..i])?;
                 blocks[which] += 1;
+                if method_r {
+                    match active_h2 {
+                        Some("Method-R macro design") => method_r_blocks[0] += 1,
+                        Some("Method-R module design") => method_r_blocks[1] += 1,
+                        _ => {}
+                    }
+                }
             }
             i += 1;
             continue;
+        }
+        if profile != ValidationProfile::Legacy && raw_html_block_start(line) {
+            return Err(invalid(
+                "raw HTML blocks are not supported in new design packages; use Markdown or fenced code examples",
+            ));
         }
         // SmartMD consumes balanced attribute blocks before Markdown parsing.
         // Their contents must not masquerade as headings, waivers or fences.
         if line.starts_with('{') {
             let start = i;
-            let mut depth = 0_i32;
-            let mut quoted = false;
-            let mut escaped = false;
-            loop {
-                for ch in lines[i].chars() {
-                    if quoted {
-                        if ch == '"' && !escaped {
-                            quoted = false;
-                        }
-                        escaped = ch == '\\' && !escaped;
-                    } else if ch == '"' {
-                        quoted = true;
-                    } else if ch == '{' {
-                        depth += 1;
-                    } else if ch == '}' {
-                        depth -= 1;
-                    }
-                }
-                if depth <= 0 && !quoted {
-                    break;
-                }
-                i += 1;
-                if i == lines.len() {
-                    return Err(invalid("unclosed SmartMD attribute block"));
-                }
-            }
+            i = attribute_end(&lines, i)?;
             if line.starts_with("{table ") {
                 let spec = lines[start..=i].join("\n");
                 let after: Vec<_> = lines[i + 1..]
@@ -150,20 +215,23 @@ pub fn validate(markdown: &str) -> Result<()> {
                 return Err(invalid("nested callout"));
             }
             let kind = rest.split_whitespace().next().unwrap_or("");
-            callout = Some((
-                ["info", "warning", "note", "tip", "success", "danger"].contains(&kind),
-                false,
-            ));
+            let supported = ["info", "warning", "note", "tip", "success", "danger"].contains(&kind);
+            if profile != ValidationProfile::Legacy && !supported {
+                return Err(invalid("unsupported SmartMD callout kind"));
+            }
+            callout = Some((supported, false));
         } else if let Some((_, content)) = callout.as_mut() {
             *content |= !line.trim().is_empty();
         } else {
             if let Some(name) = line.strip_prefix("## ") {
+                active_h2 = Some(name.trim());
                 section = SECTIONS.iter().position(|s| *s == name.trim());
                 if let Some(s) = section {
                     headings[s] = true;
                 }
             } else if line.starts_with("# ") {
                 section = None;
+                active_h2 = None;
             }
             if let Some(s) = section {
                 prose[s].push(line);
@@ -174,13 +242,26 @@ pub fn validate(markdown: &str) -> Result<()> {
     if callout.is_some() {
         return Err(invalid("unclosed callout"));
     }
-    if !has_callout {
-        return Err(invalid("nonempty SmartMD callout required"));
+    if matches!(
+        profile,
+        ValidationProfile::Legacy | ValidationProfile::Principal
+    ) {
+        if !has_callout {
+            return Err(invalid("nonempty SmartMD callout required"));
+        }
+        if !has_table {
+            return Err(invalid("SmartMD table specification and table required"));
+        }
     }
-    if !has_table {
-        return Err(invalid("SmartMD table specification and table required"));
+    if profile == ValidationProfile::Principal && method_r_blocks[0] == 0 {
+        return Err(invalid("Method-R macro design needs its scope jobflow DSL"));
     }
-    for s in 0..4 {
+    let required: Vec<usize> = match profile {
+        ValidationProfile::Legacy => (0..4).collect(),
+        ValidationProfile::Diagram(kind) => vec![kind.index()],
+        _ => vec![],
+    };
+    for s in required {
         if !headings[s] {
             return Err(invalid(&format!("missing section: {}", SECTIONS[s])));
         }
@@ -197,6 +278,201 @@ pub fn validate(markdown: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// CommonMark HTML block starts can swallow otherwise valid-looking heading and
+// fence lines. New packages use portable Markdown/SmartMD instead. Inline tags
+// within a paragraph and escaped/fenced/indented code are not block starts.
+fn raw_html_block_start(line: &str) -> bool {
+    let line_start = line.trim_start_matches(' ');
+    if line.len() - line_start.len() > 3 {
+        return false;
+    }
+    let Some(after_open) = line_start.strip_prefix('<') else {
+        return false;
+    };
+    if after_open.starts_with('?')
+        || after_open.starts_with("![")
+        || after_open
+            .strip_prefix('!')
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
+    {
+        return true;
+    }
+    let tag = after_open.strip_prefix('/').unwrap_or(after_open);
+    if !tag.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let end = tag
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .unwrap_or(tag.len());
+    let rest = &tag[end..];
+    if !rest.is_empty()
+        && !rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+    {
+        return false;
+    }
+    let name = tag[..end].to_ascii_lowercase();
+    let block_tags = "address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option p param search section summary table tbody td tfoot th thead title tr track ul pre script style textarea";
+    if block_tags.split_whitespace().any(|tag| tag == name) {
+        return true;
+    }
+    let mut quote = None;
+    for (index, character) in rest.char_indices() {
+        match character {
+            '\'' | '"' if quote == Some(character) => quote = None,
+            '\'' | '"' if quote.is_none() => quote = Some(character),
+            '>' if quote.is_none() => return rest[index + 1..].trim().is_empty(),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn attribute_end(lines: &[&str], start: usize) -> Result<usize> {
+    let mut depth = 0_i32;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (i, line) in lines.iter().enumerate().skip(start) {
+        for ch in line.chars() {
+            if quoted {
+                if ch == '"' && !escaped {
+                    quoted = false;
+                }
+                escaped = ch == '\\' && !escaped;
+            } else if ch == '"' {
+                quoted = true;
+            } else if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+            }
+        }
+        if depth <= 0 && !quoted {
+            return Ok(i);
+        }
+    }
+    Err(invalid("unclosed SmartMD attribute block"))
+}
+
+/// Observable prose/headings for package trace and link checks. Examples,
+/// comments, attributes and frontmatter cannot define architecture sections.
+/// Callout prose is retained for references but cannot impersonate headings.
+pub(crate) fn outline_lines(markdown: &str) -> Result<Vec<String>> {
+    let clean = without_comments(markdown)?;
+    let lines: Vec<_> = clean.lines().collect();
+    let end = lines
+        .iter()
+        .skip(1)
+        .position(|line| *line == "---")
+        .map(|index| index + 1)
+        .ok_or_else(|| invalid("unclosed frontmatter"))?;
+    let mut output = Vec::new();
+    let mut callout = false;
+    let mut i = end + 1;
+    while i < lines.len() {
+        let line = lines[i];
+        if fence(line).is_some() {
+            i = fence_end(&lines, i)? + 1;
+            continue;
+        }
+        if raw_html_block_start(line) {
+            return Err(invalid(
+                "raw HTML blocks cannot define package sections or trace records",
+            ));
+        }
+        if line.starts_with('{') {
+            i = attribute_end(&lines, i)? + 1;
+            continue;
+        }
+        if line == ":::" {
+            callout = false;
+        } else if line.starts_with(":::") {
+            callout = true;
+        } else {
+            output.push(if callout {
+                format!(" {line}")
+            } else {
+                line.to_owned()
+            });
+        }
+        i += 1;
+    }
+    Ok(output)
+}
+
+/// Heading ordinals whose own section (including its subordinate headings)
+/// contains an actual orchestrator jobflow. Match outline_lines' real heading
+/// order, preserving duplicate-heading identity rather than matching titles.
+pub(crate) fn orchestrator_jobflow_headings(
+    markdown: &str,
+) -> Result<std::collections::HashSet<usize>> {
+    let clean = without_comments(markdown)?;
+    let lines: Vec<_> = clean.lines().collect();
+    let end = lines
+        .iter()
+        .skip(1)
+        .position(|line| *line == "---")
+        .map(|index| index + 1)
+        .ok_or_else(|| invalid("unclosed frontmatter"))?;
+    let mut result = std::collections::HashSet::new();
+    let mut ancestors = Vec::new();
+    let mut next_heading = 0;
+    let mut callout = false;
+    let mut i = end + 1;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some((_, _, language)) = fence(line) {
+            let closing = fence_end(&lines, i)?;
+            if !callout
+                && language == "jobflow"
+                && lines[i + 1..closing]
+                    .iter()
+                    .any(|line| line.trim_start().starts_with("orchestrator:"))
+            {
+                validate_dsl(1, &lines[i + 1..closing])?;
+                result.extend(ancestors.iter().map(|(_, ordinal)| *ordinal));
+            }
+            i = closing + 1;
+            continue;
+        }
+        if raw_html_block_start(line) {
+            return Err(invalid("raw HTML blocks cannot supply a module diagram"));
+        }
+        if line.starts_with('{') {
+            i = attribute_end(&lines, i)? + 1;
+            continue;
+        }
+        if line == ":::" {
+            callout = false;
+        } else if line.starts_with(":::") {
+            callout = true;
+        } else if !callout {
+            if let Some((level, _)) = atx_heading(line) {
+                ancestors.retain(|(ancestor_level, _)| *ancestor_level < level);
+                ancestors.push((level, next_heading));
+                next_heading += 1;
+            }
+        }
+        i += 1;
+    }
+    Ok(result)
+}
+
+pub(crate) fn atx_heading(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 {
+        return None;
+    }
+    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let title = &trimmed[level..];
+    if !title.is_empty() && !title.starts_with([' ', '\t']) {
+        return None;
+    }
+    Some((level, title.trim()))
 }
 
 fn without_comments(text: &str) -> Result<String> {

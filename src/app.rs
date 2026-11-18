@@ -2,6 +2,7 @@
 use crate::{
     ai,
     config::Settings,
+    design_package::{DesignDocument, DocumentKind, MAIN_FILENAME, package_hash},
     domain, files,
     model::*,
     storage::{EventInput, EventRecord, ReceiptInput, Store},
@@ -140,8 +141,15 @@ impl App {
     pub fn workspace(&self) -> Result<Value> {
         let i = self.lock();
         let scan = self.files.scan()?;
+        let mut document_types =
+            vec![json!({"kind":"architecture","filename":MAIN_FILENAME,"title":"아키텍처 설계"})];
+        document_types.extend(
+            DocumentKind::ALL
+                .into_iter()
+                .map(|kind| json!({"kind":kind,"filename":kind.filename(),"title":kind.title()})),
+        );
         Ok(
-            json!({"project_name":self.root.file_name().unwrap_or_default().to_string_lossy(),"root_display":self.root.display().to_string(),"sessions":i.state.sessions,"settings":i.state.settings,"settings_revision":i.state.settings_revision,"workspace_revision":i.state.workspace_revision,"context_files":scan.files,"active_run":active_run(&i.state),"runs":i.state.runs,"exports":i.state.exports,"latest_run":i.state.runs.last(),"cursor":i.store.latest_cursor()?}),
+            json!({"project_name":self.root.file_name().unwrap_or_default().to_string_lossy(),"root_display":self.root.display().to_string(),"sessions":i.state.sessions,"settings":i.state.settings,"settings_revision":i.state.settings_revision,"workspace_revision":i.state.workspace_revision,"context_files":scan.files,"document_types":document_types,"active_run":active_run(&i.state),"runs":i.state.runs,"exports":i.state.exports,"latest_run":i.state.runs.last(),"cursor":i.store.latest_cursor()?}),
         )
     }
     pub fn session(&self, id: &str) -> Result<Value> {
@@ -635,10 +643,23 @@ impl App {
                                 AppError::new("not_found", "저장할 초안이 없습니다.")
                             })?;
                             let rendered = domain::render_export(s, d);
-                            let mut plan = self.files.preview_in(
+                            let documents: Vec<_> = d
+                                .documents
+                                .iter()
+                                .map(|document| DesignDocument {
+                                    kind: document.kind,
+                                    markdown: domain::render_export_markdown(
+                                        s,
+                                        d,
+                                        &document.markdown,
+                                    ),
+                                })
+                                .collect();
+                            let mut plan = self.files.preview_documents_in(
                                 &next.settings.documents.directory,
                                 &s.title,
                                 &rendered,
+                                &documents,
                                 d.input_revision,
                                 &s.id,
                             )?;
@@ -866,13 +887,15 @@ impl App {
             Ok(out) if !cancelled && !stale => {
                 let mut s = next.sessions[spos].clone();
                 let apply = match kind {
-                    "design" => domain::validate_design(&out.text).map(|text| {
-                        let markdown = format!("{}{}", text, domain::trace_appendix(&s));
+                    "design" => domain::validate_design_package(&out.text).map(|package| {
+                        let markdown =
+                            format!("{}{}", package.markdown, domain::trace_appendix(&s));
                         let d = Draft {
                             id: id(),
                             input_revision: s.design_revision,
-                            hash: hash(&markdown),
+                            hash: package_hash(&markdown, &package.documents),
                             markdown,
+                            documents: package.documents,
                             created_at: now(),
                             content_status: "draft".into(),
                             reviewed: false,
@@ -940,7 +963,11 @@ impl App {
                 draft_bytes = next.sessions[spos]
                     .drafts
                     .last()
-                    .map(|d| d.markdown.len())
+                    .map(|d| d.markdown.len()
+                        + d.documents
+                            .iter()
+                            .map(|document| document.markdown.len())
+                            .sum::<usize>())
                     .unwrap_or(0),
                 "run phase"
             );
@@ -1057,7 +1084,7 @@ impl App {
 fn validate_output(s: &Session, kind: &str, text: &str) -> anyhow::Result<()> {
     let mut s = s.clone();
     match kind {
-        "design" => domain::validate_design(text).map(|_| ()),
+        "design" => domain::validate_design_package(text).map(|_| ()),
         "critic" => domain::apply_critic(&mut s, text),
         _ => domain::apply_conversation(&mut s, domain::parse_json(text)?),
     }

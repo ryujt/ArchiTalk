@@ -126,7 +126,7 @@ async fn workflow(backend: Backend) {
     let config = conf.path().join("architalk.toml");
     let mut settings = Settings::default();
     settings.ai.default_backend = backend;
-    settings.ai.timeout_seconds = 180;
+    settings.ai.timeout_seconds = 300;
     match backend {
         Backend::Claude => settings.ai.backends.claude.effort = Some("low".into()),
         Backend::Codex => settings.ai.backends.codex.effort = Some("low".into()),
@@ -181,6 +181,7 @@ async fn workflow(backend: Backend) {
     let session = server.settle(sid).await;
     let draft = &session["drafts"][0];
     assert_eq!(draft["reviewed"], true);
+    assert_eq!(draft["documents"].as_array().unwrap().len(), 9);
     let preview = server
         .post(
             &format!("sessions/{sid}/exports"),
@@ -196,6 +197,18 @@ async fn workflow(backend: Backend) {
         )
         .await;
     assert_eq!(saved["export"]["status"], "completed");
+    let paths = saved["export"]["result"]["paths"].as_array().unwrap();
+    assert_eq!(paths.len(), 10);
+    let artifacts: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let path = path.as_str().unwrap().to_owned();
+            let content = std::fs::read_to_string(project.path().join(&path)).unwrap();
+            assert!(content.starts_with("---\n"));
+            assert!(content.contains("검토 및 저장 기준"));
+            (path, content)
+        })
+        .collect();
     let path = saved["export"]["result"]["paths"][0]
         .as_str()
         .unwrap()
@@ -206,7 +219,7 @@ async fn workflow(backend: Backend) {
     let w = server.get("workspace").await;
     let runs = w["runs"].as_array().unwrap();
     println!(
-        "real {backend} workflow: {} completed runs, {} byte document, {} review findings; all outputs in isolated temporary project",
+        "real {backend} workflow: {} completed runs, 10 documents ({} bytes in principal), {} review findings; all outputs in isolated temporary project",
         runs.len(),
         markdown.len(),
         session["findings"].as_array().unwrap().len()
@@ -226,6 +239,16 @@ async fn workflow(backend: Backend) {
     let w = server.get("workspace").await;
     assert_eq!(w["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(w["exports"][0]["status"], "completed");
+    assert_eq!(
+        w["sessions"][0]["drafts"][0]["documents"],
+        draft["documents"]
+    );
+    for (path, content) in artifacts {
+        assert_eq!(
+            std::fs::read_to_string(project.path().join(path)).unwrap(),
+            content
+        );
+    }
     assert_eq!(
         std::fs::read_to_string(project.path().join(path)).unwrap(),
         markdown

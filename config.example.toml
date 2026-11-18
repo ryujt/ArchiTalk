@@ -1,6 +1,6 @@
 [ai]
 default_backend = "claude"
-timeout_seconds = 180
+timeout_seconds = 300
 
 [ai.backends.claude]
 executable = "claude"

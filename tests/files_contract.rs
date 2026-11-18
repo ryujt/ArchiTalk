@@ -10,6 +10,77 @@ use std::{
 fn plan(root: &std::path::Path) -> files::ExportPlan {
     files::preview(root, "회원 알림 서비스", "# 설계\n", 7, "session").unwrap()
 }
+fn package_plan(root: &std::path::Path) -> files::ExportPlan {
+    let package: architalk::design_package::DesignPackage =
+        serde_json::from_str(include_str!("fixtures/design-package.json")).unwrap();
+    files::preview_documents_in(
+        root,
+        "docs/architecture",
+        "패키지",
+        &package.markdown,
+        &package.documents,
+        7,
+        "session",
+    )
+    .unwrap()
+}
+
+#[test]
+fn ten_file_package_recovers_partial_publication_and_retains_manifest_v1() {
+    let root = tempfile::tempdir().unwrap();
+    let plan = package_plan(root.path());
+    assert_eq!(plan.files.len(), 10);
+    assert_eq!(plan.document_hash, plan.files[0].hash);
+    assert_eq!(
+        plan.files[0].relative_path,
+        architalk::design_package::MAIN_FILENAME
+    );
+    let reserved = files::reserve(root.path(), &plan).unwrap();
+    let persisted = serde_json::from_value(serde_json::to_value(reserved).unwrap()).unwrap();
+    let directory = root.path().join(&plan.relative_directory);
+    for index in [0, 3, 8] {
+        let file = &plan.files[index];
+        fs::write(directory.join(&file.relative_path), &file.content).unwrap();
+    }
+    assert!(!directory.join(".architalk-export.json").exists());
+    let result = files::reconcile(root.path(), &persisted).unwrap();
+    assert_eq!(result.status, ExportStatus::Completed);
+    assert_eq!(result.paths.len(), 10);
+    assert!(result.files.iter().all(|file| file.status == "applied"));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join(".architalk-export.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["document_hash"], plan.files[0].hash);
+    assert_eq!(manifest["files"].as_array().unwrap().len(), 10);
+    for file in &plan.files {
+        assert_eq!(
+            files::hash_bytes(&fs::read(directory.join(&file.relative_path)).unwrap()),
+            file.hash
+        );
+    }
+    assert_eq!(
+        files::apply(root.path(), &persisted).unwrap().status,
+        ExportStatus::Completed
+    );
+}
+
+#[test]
+fn conflict_in_last_package_member_prevents_publication_of_all_missing_members() {
+    let root = tempfile::tempdir().unwrap();
+    let plan = files::reserve(root.path(), &package_plan(root.path())).unwrap();
+    let directory = root.path().join(&plan.relative_directory);
+    let conflict = directory.join(&plan.files[9].relative_path);
+    fs::write(&conflict, "외부 편집 내용").unwrap();
+    let result = files::apply(root.path(), &plan).unwrap();
+    assert_eq!(result.status, ExportStatus::Conflict);
+    assert!(result.paths.is_empty());
+    assert_eq!(fs::read_to_string(conflict).unwrap(), "외부 편집 내용");
+    assert!(!directory.join(".architalk-export.json").exists());
+    for file in &plan.files[..9] {
+        assert!(!directory.join(&file.relative_path).exists());
+    }
+}
 #[test]
 fn partial_export_recovers_hashes_and_publishes_manifest_last() {
     let root = tempfile::tempdir().unwrap();

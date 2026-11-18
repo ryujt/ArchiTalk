@@ -1001,24 +1001,44 @@ pub fn trace_appendix(s: &Session) -> String {
 }
 
 pub fn prompt(s: &Session, kind: &str, language: &str) -> Result<String> {
-    let context = json!({"title":s.title,"design_revision":s.design_revision,"messages":s.messages,"evidence":s.evidence,"active_claims":s.claims.iter().filter(|v|active(&v.status)).collect::<Vec<_>>(),"superseded_claims":s.claims.iter().filter(|v|!active(&v.status)).collect::<Vec<_>>(),"active_requirements":s.requirements.iter().filter(|v|active(&v.status)).collect::<Vec<_>>(),"superseded_requirements":s.requirements.iter().filter(|v|!active(&v.status)).collect::<Vec<_>>(),"active_decisions":s.decisions.iter().filter(|v|active(&v.status)).collect::<Vec<_>>(),"superseded_decisions":s.decisions.iter().filter(|v|!active(&v.status)).collect::<Vec<_>>(),"coverage":s.coverage,"questions":s.questions,"draft":if kind=="critic"{s.drafts.last().map(|d|d.markdown.clone())}else{None}});
+    let draft = if kind == "critic" {
+        s.drafts.last().map(|draft| json!({
+            "format": if draft.documents.is_empty() { "legacy-single-document" } else { "architecture-package-v1" },
+            "filename": crate::design_package::MAIN_FILENAME,
+            "markdown": draft.markdown,
+            "documents": draft.documents.iter().map(|document| json!({
+                "kind": document.kind,
+                "filename": document.kind.filename(),
+                "markdown": document.markdown,
+            })).collect::<Vec<_>>()
+        }))
+    } else {
+        None
+    };
+    let legacy_review = kind == "critic"
+        && s.drafts
+            .last()
+            .is_some_and(|draft| draft.documents.is_empty());
+    let context = json!({"title":s.title,"design_revision":s.design_revision,"messages":s.messages,"evidence":s.evidence,"active_claims":s.claims.iter().filter(|v|active(&v.status)).collect::<Vec<_>>(),"superseded_claims":s.claims.iter().filter(|v|!active(&v.status)).collect::<Vec<_>>(),"active_requirements":s.requirements.iter().filter(|v|active(&v.status)).collect::<Vec<_>>(),"superseded_requirements":s.requirements.iter().filter(|v|!active(&v.status)).collect::<Vec<_>>(),"active_decisions":s.decisions.iter().filter(|v|active(&v.status)).collect::<Vec<_>>(),"superseded_decisions":s.decisions.iter().filter(|v|!active(&v.status)).collect::<Vec<_>>(),"coverage":s.coverage,"questions":s.questions,"draft":draft});
     let context = serde_json::to_string(&context)?;
     if context.len() > 900_000 {
-        bail!("context too large; select fewer project files or start a narrower design session");
+        bail!(
+            "complete design/review context exceeds 900000 bytes; select fewer source files or narrow the session before retrying"
+        );
     }
     let task = match kind {
         "design" => {
-            r#"Create an implementable software architecture document from the supplied conversation. Return ONLY one JSON object {"markdown":"..."}. Use active_* records as current proposals and superseded_* only as historical audit evidence; never carry a superseded requirement into the active design. Include purpose/users, scope and exclusions, functional requirements and acceptance scenarios, context/components/ownership, data and contracts, runtime/deployment and failure recovery, measurable quality targets OR unknowns with validation plans, alternatives/tradeoffs/ADRs, risks/open issues, implementation and verification steps. Use Mermaid for a useful context or component diagram. Scale depth to scope and risk independently. Keep unknown facts unknown; do not invent load/SLA/domain rules. Show evidence references. A concise single document is preferred. Do NOT claim user approval."#
+            r#"Create an implementable engineering architecture DESIGN PACKAGE from the supplied conversation. Return ONLY one JSON object {"markdown":"principal Method-R architecture", "documents":[{"kind":"drivers|quality_scenarios|alternatives|decisions|delivery|navigation|jobflow|state|screen_layout","markdown":"complete type-specific document"}]}, with exactly one document for each of the nine kinds. Follow the complete package contract below. Use active_* as current proposals and superseded_* only as historical evidence. Develop the reasoning chain from business goals and architecture drivers to measurable quality scenarios, tactics/styles/patterns, materially different alternatives, explicit trade-offs, proposed decisions, ADRs and verification. Use Method-R macro/system/module/detail views and dedicated Jobflow for significant collaboration, plus separate Navigation, Jobflow, State and Screen Layout artifacts. Scale depth by scope and risk. Keep unknown facts unknown; missing interview answers require conditional alternatives, measurement methods, proposed responsible roles and decision conditions. Do not borrow lecture traffic, SLOs, cloud or database choices. Never turn a proposed number, technology, owner or decision into a confirmed requirement or measured result. Preserve actual source/requirement IDs. Do not claim user approval or completed verification."#
         }
         "critic" => {
-            r#"Independently review the latest architecture against active_* requirements and sources. Treat superseded_* as history, and flag an obsolete statement presented as a current requirement. Return ONLY {"findings":[{"severity":"major|critical|minor","text":"specific defect","evidence":"source reference and counterexample","impact":"observable consequence","proposed_resolution":"concrete correction"}]}. Return [] if there is no supported defect. Do not invent obligations or demand complexity just for completeness. Prioritize contradictions, missing ownership/recovery, unverifiable requirements. You cannot edit files or approve the document."#
+            r#"Independently review the ENTIRE supplied latest architecture package against active_* requirements and sources. Read the principal markdown and every companion document in draft.documents, including their final sections; findings identify the affected server filename and DRV/QA/ALT/ADR/VAL IDs. Assess the drivers→measurable quality→tactics/styles/patterns→trade-offs→decision→ADR→verification chain, Method-R boundary/ownership/contracts/decomposition, consistency of Navigation/Jobflow/State/Screen Layout, failure/unknown outcomes, evidence and unresolved decision conditions. Flag unsupported technology/SLO/traffic claims, superficial summaries, untested trade-offs and proposed choices presented as accepted. Treat superseded_* as history and flag obsolete statements presented as current requirements. For draft.format legacy-single-document, review the supplied historical artifact against its sources. Do not retroactively require companion documents or Method-R sections from a historical draft. Return ONLY {"findings":[{"severity":"major|critical|minor","text":"specific defect","evidence":"source reference and counterexample","impact":"observable consequence","proposed_resolution":"concrete correction"}]}; use {"findings":[]} if no supported defect exists. Do not invent obligations or demand complexity just for completeness. You cannot edit files or approve the document. Never claim complete review when a supplied artifact has not been reviewed."#
         }
         _ => {
             r#"Help the user design this project through natural conversation. Read known sources before asking. Ask ONE important question at a time and explain why. Separate scale, failure impact and domain. Do not ask for technology before understanding scenarios. Preserve 'unknown', delegation and deferral; never turn a model proposal into a confirmed user statement. Return ONLY a JSON object shaped {"reply":"short understanding only, no question; put the one next question in questions","claims":[{"id":null,"supersedes":null,"text":"interpretation","kind":"interpretation|assumption|proposal","evidence_refs":["actual source id"],"source_quote":"exact substring from that source"}],"requirements":[{"id":null,"supersedes":null,"text":"requirement","acceptance":"verifiable scenario","evidence_refs":["actual source id"],"source_quote":"exact substring from that source"}],"coverage_updates":[{"id":"existing coverage id","reason":"what was established","evidence_refs":["source id"],"source_quote":"exact user/file quote"}],"questions":[{"target_ref":"unknown coverage id","text":"one useful question","reason":"design impact","options":["choice"],"priority_class":3}],"decisions":[{"id":null,"supersedes":null,"evidence_refs":["actual source id"],"source_quote":"exact source quote","title":"choice","alternatives":["A","B"],"rationale":"why","consequences":"cost/risk","requirement_refs":[]}]}. Arrays may be empty. reply is a summary only: no question marks and no question text; each question candidate contains one question and its reason is a non-question explanation. Server rules choose conflict before risk blockers before core gaps, regardless of priority_class. To correct an existing claim/requirement/decision, set supersedes to its existing stable id (or use id as the amendment target); never invent a new id. Supply an exact quote from the latest USER message for every amendment; unknown/delegated/deferred replies cannot supersede established information. Even when text stays the same, changed acceptance/evidence is an amendment, not a duplicate. New versions remain proposed. Read active_* as current proposals and superseded_* as history only; do not reintroduce historical statements as current facts. Never mark unknown/deferred information covered. Required/blocker flags belong to application rules; you cannot change them. Quote references must exist. For payment, irreversible actions, sensitive data: discuss failure/duplicates/recovery before minor preferences. If enough is known, summarize and suggest drafting; do not claim completion."#
         }
     };
-    let document_rules = if matches!(kind, "design" | "critic") {
-        crate::document_format::RULES
+    let document_rules = if matches!(kind, "design" | "critic") && !legacy_review {
+        crate::design_package::RULES
     } else {
         ""
     };
@@ -1044,6 +1064,17 @@ pub fn validate_design(text: &str) -> Result<String> {
     crate::document_format::validate(&c.markdown)?;
     Ok(c.markdown)
 }
+/// New generation accepts the complete typed package atomically. Legacy
+/// validation/export remains available for archived single-document artifacts.
+pub fn validate_design_package(text: &str) -> Result<crate::design_package::DesignPackage> {
+    if text.len() > crate::design_package::MAX_PACKAGE_BYTES * 6 + 10_000 {
+        bail!("architecture design package response exceeds the JSON byte limit");
+    }
+    let package = serde_json::from_str(text.trim())
+        .context("AI response must match the complete design package JSON schema")?;
+    crate::design_package::validate(package)
+}
+
 pub fn apply_critic(s: &mut Session, text: &str) -> Result<()> {
     let c: CriticCandidate = parse_json(text)?;
     if c.findings.len() > 30 {
@@ -1081,13 +1112,19 @@ pub fn apply_critic(s: &mut Session, text: &str) -> Result<()> {
 }
 
 pub fn effective_summary(spec: &crate::ai::RunSpec) -> Value {
-    json!({"backend":spec.backend,"executable":spec.executable,"model":spec.model.clone().unwrap_or("cli_default".into()),"effort":spec.effort.clone().unwrap_or("cli_default".into()),"profile":spec.profile,"timeout_seconds":spec.timeout_seconds,"prompt_version":"architalk-v3-smartmd","schema_version":2})
+    json!({"backend":spec.backend,"executable":spec.executable,"model":spec.model.clone().unwrap_or("cli_default".into()),"effort":spec.effort.clone().unwrap_or("cli_default".into()),"profile":spec.profile,"timeout_seconds":spec.timeout_seconds,"prompt_version":"architalk-v4-design-package","schema_version":3})
 }
 
 /// Export metadata is appended to the immutable source draft, without rewriting
 /// prior input snapshots or presenting later answers as part of an old design.
 pub fn render_export(s: &Session, d: &Draft) -> String {
-    let mut text = d.markdown.clone();
+    render_export_markdown(s, d, &d.markdown)
+}
+
+/// Apply shared review metadata while preserving any package member's source
+/// frontmatter and body. Stored drafts themselves remain immutable.
+pub fn render_export_markdown(s: &Session, d: &Draft, markdown: &str) -> String {
+    let mut text = markdown.to_owned();
     text.push_str(&format!(
         "\n\n## 검토 및 저장 기준\n\n내용 상태: {} · 설계 버전: {} · 독립 검토: {}\n",
         d.content_status,

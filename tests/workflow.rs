@@ -209,6 +209,7 @@ fn reopening_a_major_finding_revokes_approval_and_invalidates_preview() {
         id: id(),
         input_revision: s.design_revision,
         markdown: "# 메모 설계\n로컬 파일에 저장합니다.".into(),
+        documents: vec![],
         hash: hash("# 메모 설계\n로컬 파일에 저장합니다."),
         created_at: now(),
         content_status: "approved".into(),
@@ -306,6 +307,11 @@ fn fixture(dir: &std::path::Path) -> String {
     std::fs::write(
         dir.join("architecture.smart.md"),
         include_str!("fixtures/architecture.smart.md"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("design-package.json"),
+        include_str!("fixtures/design-package.json"),
     )
     .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -462,6 +468,13 @@ async fn full_controller_workflow_uses_real_subprocess_db_files_and_recovers() {
     settled(&app).await;
     let s = app.session(&sid).unwrap();
     assert_eq!(s["drafts"][0]["reviewed"], true);
+    assert_eq!(s["drafts"][0]["documents"].as_array().unwrap().len(), 9);
+    let generated: architalk::model::Draft =
+        serde_json::from_value(s["drafts"][0].clone()).unwrap();
+    assert_eq!(
+        generated.hash,
+        architalk::design_package::package_hash(&generated.markdown, &generated.documents)
+    );
     let did = s["drafts"][0]["id"].as_str().unwrap();
     let d_rev = s["drafts"][0]["input_revision"].clone();
     let error = app

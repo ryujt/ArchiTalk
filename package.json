@@ -2,7 +2,7 @@
   "name": "architalk-browser-tests",
   "private": true,
   "scripts": {
-    "test:web": "node --test tests/web.test.mjs",
+    "test:web": "node --test tests/web.test.mjs tests/design-package-ui.test.mjs",
     "pretest:browser": "cargo build --bin architalk",
     "test:browser": "playwright test"
   },

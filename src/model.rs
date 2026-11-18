@@ -150,6 +150,8 @@ pub struct Draft {
     pub id: String,
     pub input_revision: u64,
     pub markdown: String,
+    #[serde(default)]
+    pub documents: Vec<crate::design_package::DesignDocument>,
     pub hash: String,
     pub created_at: String,
     pub content_status: String,

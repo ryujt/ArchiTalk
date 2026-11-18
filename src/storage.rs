@@ -13,7 +13,32 @@ use std::{
     sync::OnceLock,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// Capture committed pages, including an existing WAL, before changing the
+/// snapshot compatibility marker. The destination stays inside the pinned state
+/// directory and is created exclusively before SQLite opens it.
+fn backup_before_migration(connection: &Connection, state: &Directory, target: i64) -> Result<()> {
+    let name = format!("workspace.pre-v{target}-{}.db", uuid::Uuid::new_v4());
+    let file = state.create_private_file(&name)?;
+    let mut destination = Connection::open_with_flags_and_vfs(
+        state.fd_path().join(&name),
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        "architalk-dirfd",
+    )?;
+    {
+        let backup = rusqlite::backup::Backup::new(connection, &mut destination)?;
+        if backup.step(-1)? != rusqlite::backup::StepResult::Done {
+            bail!("workspace migration backup could not acquire a consistent snapshot");
+        }
+    }
+    destination.close().map_err(|(_, error)| error)?;
+    file.sync_all()?;
+    state.sync()?;
+    Ok(())
+}
 #[derive(Clone, Debug)]
 pub struct ReceiptInput {
     pub command_id: String,
@@ -133,7 +158,7 @@ unsafe extern "C" fn dirfd_full_pathname(
             let descriptor = parts.next().unwrap_or_default();
             !descriptor.is_empty()
                 && descriptor.iter().all(u8::is_ascii_digit)
-                && parts.next() == Some(b"workspace.db".as_slice())
+                && parts.next().is_some_and(sqlite_owned_filename)
                 && parts.next().is_none()
         });
     if !valid || size <= 0 || path.len() >= size as usize {
@@ -143,6 +168,26 @@ unsafe extern "C" fn dirfd_full_pathname(
         std::ptr::copy_nonoverlapping(input, output, path.len() + 1);
     }
     rusqlite::ffi::SQLITE_OK
+}
+
+fn sqlite_owned_filename(name: &[u8]) -> bool {
+    let base = name
+        .strip_suffix(b"-journal")
+        .or_else(|| name.strip_suffix(b"-wal"))
+        .or_else(|| name.strip_suffix(b"-shm"))
+        .unwrap_or(name);
+    if base == b"workspace.db" {
+        return true;
+    }
+    let Some(uuid) = base
+        .strip_prefix(b"workspace.pre-v1-")
+        .or_else(|| base.strip_prefix(b"workspace.pre-v2-"))
+        .and_then(|value| value.strip_suffix(b".db"))
+        .and_then(|value| std::str::from_utf8(value).ok())
+    else {
+        return false;
+    };
+    uuid::Uuid::parse_str(uuid).is_ok_and(|parsed| parsed.to_string() == uuid)
 }
 
 // None means ordinary SQLite usage: preserve the process default VFS behavior.
@@ -167,10 +212,7 @@ unsafe fn routed_path<'a>(path: *const c_char) -> Option<(c_int, &'a CStr)> {
     if name.is_empty() {
         return Some((fd, c"."));
     }
-    if !matches!(
-        name,
-        b"workspace.db" | b"workspace.db-journal" | b"workspace.db-wal" | b"workspace.db-shm"
-    ) {
+    if !sqlite_owned_filename(name) {
         return None;
     }
     // CStr points into the caller's nul-terminated pathname after its final '/'.
@@ -343,15 +385,21 @@ impl Store {
         if version == 0 {
             // Existing unversioned SQLite files are never changed without a backup.
             if db.metadata()?.len() > 0 {
-                let name = format!("workspace.pre-v1-{}.db", uuid::Uuid::new_v4());
-                state.backup_file(&name, &db)?;
+                backup_before_migration(&connection, &state, 1)?;
             }
             let tx = connection.transaction()?;
             tx.execute_batch("CREATE TABLE workspace (id INTEGER PRIMARY KEY CHECK(id=1), snapshot TEXT NOT NULL);
                 CREATE TABLE receipts (command_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, response TEXT NOT NULL);
                 CREATE TABLE events (cursor INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL);
                 CREATE INDEX events_by_session ON events(session_id,cursor);
-                PRAGMA user_version=1;")?;
+                PRAGMA user_version=2;")?;
+            tx.commit()?;
+        } else if version == 1 {
+            // v1 readers ignore unknown JSON fields, so they must refuse v2
+            // before they can discard a package's supporting documents.
+            backup_before_migration(&connection, &state, 2)?;
+            let tx = connection.transaction()?;
+            tx.execute_batch("PRAGMA user_version=2;")?;
             tx.commit()?;
         }
         connection.pragma_update(None, "journal_mode", "DELETE")?;

@@ -108,6 +108,21 @@ test('settings forms preserve trusted executables/profiles and set per-backend/r
   assert.equal(settings.ai.default_backend,'claude');
 });
 
+test('request time limits accept whole seconds within bounds and preserve omitted legacy form values',()=>{
+  const original=structuredClone(settings);
+  for(const seconds of ['10','300','600']) {
+    const changed=settingsFromValues(settings,{'default-backend':'claude','timeout-seconds':seconds});
+    assert.equal(changed.ai.timeout_seconds,Number(seconds));
+    assert.equal(changed.ai.backends.codex.executable,settings.ai.backends.codex.executable);
+    assert.equal(changed.ai.backends.codex.profile,settings.ai.backends.codex.profile);
+  }
+  assert.equal(settingsFromValues(settings,{'default-backend':'claude'}).ai.timeout_seconds,180);
+  for(const seconds of ['', ' ', '9', '601', '-10', '10.5', 'NaN', 'Infinity', 'not-a-number']) {
+    assert.throws(()=>settingsFromValues(settings,{'timeout-seconds':seconds}),error=>error instanceof ApiError&&error.code==='INVALID_SETTINGS'&&/10~600.*정수/.test(error.message),seconds);
+  }
+  assert.deepEqual(settings,original,'settings changes must not alter an active run or its source settings');
+});
+
 test('output directory client validation rejects traversal and absolute paths',()=>{
   for(const path of ['/tmp/result','../result','docs/../result','C:/result','\\server\\result','docs\\result','~/result','docs//result','docs/./result','docs/'])assert.equal(safeRelativeDirectory(path),false,path);
   assert.equal(safeRelativeDirectory('docs/architecture/서비스-개정-2'),true);

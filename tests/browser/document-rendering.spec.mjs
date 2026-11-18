@@ -1,7 +1,8 @@
 import {test,expect} from './fixtures.mjs';
 import {readFile,writeFile} from 'node:fs/promises';
 
-const representative=await readFile(new URL('../fixtures/architecture.smart.md',import.meta.url),'utf8');
+const packageFixture=JSON.parse(await readFile(new URL('../fixtures/design-package.json',import.meta.url),'utf8'));
+const representative=packageFixture.markdown;
 const languageKinds=['navigation','jobflow','state','layout'];
 const diagram=(page,language)=>page.locator(`.markdown figure.document-diagram[data-diagram="${language}"]`);
 
@@ -89,7 +90,7 @@ async function observe(page) {
       svg:figure.querySelectorAll('svg').length,layout:figure.querySelectorAll('.layout-preview').length,
       width:figure.getBoundingClientRect().width
     })),
-    rawSource:element.textContent.includes('```navigation'),
+    rawSource:/```(?:navigation|jobflow|state|layout)/.test(element.textContent),
     viewport:innerWidth,documentWidth:document.documentElement.scrollWidth
   }));
 }
@@ -97,34 +98,21 @@ async function observe(page) {
 async function assertRepresentative(page) {
   await expect(page.locator('.markdown')).toHaveAttribute('aria-busy','false');
   await expect(page.locator('.markdown h1')).toHaveText('알림 서비스 아키텍처');
-  await expect(page.locator('.markdown table')).toHaveCount(2);
+  await expect(page.locator('.markdown table')).toHaveCount(1);
   await expect(page.locator('.markdown .smart-frontmatter')).toContainText('style: smartmd');
-  await expect(page.locator('.markdown .smart-callout-title').filter({hasText:'설계 범위와 근거'})).toHaveText('설계 범위와 근거');
-  await expect(page.locator('.markdown .smart-caption')).toHaveText('요구사항과 확인 상태');
+  await expect(page.locator('.markdown .smart-callout-title').filter({hasText:'합성 설계의 범위와 불확실성'})).toHaveText('합성 설계의 범위와 불확실성');
+  await expect(page.locator('.markdown .smart-caption')).toHaveText('설계 문서와 책임');
   const columns=await page.locator('.markdown table').first().locator('th').evaluateAll(cells=>cells.map(cell=>({width:cell.style.width,align:cell.style.textAlign})));
-  expect(columns).toEqual([{width:'60%',align:'left'},{width:'40%',align:'left'}]);
-  for(const language of languageKinds){
-    const count=language==='layout'?2:1;
-    await expect(diagram(page,language)).toHaveCount(count);
-    for(const figure of await diagram(page,language).all())await expect(figure).toHaveAttribute('data-diagram-status','ready');
+  expect(columns).toEqual([{width:'50%',align:'left'},{width:'50%',align:'left'}]);
+  await expect(diagram(page,'jobflow')).toHaveCount(2);
+  for(const figure of await diagram(page,'jobflow').all()){
+    await expect(figure).toHaveAttribute('data-diagram-status','ready');
+    await expect(figure.locator('svg')).toHaveCount(1);
   }
-  for(const language of ['navigation','jobflow','state']){
-    const svg=diagram(page,language).locator('svg');
-    await expect(svg).toHaveCount(1);
-    const geometry=await svg.evaluate(element=>({
-      width:element.getBoundingClientRect().width,height:element.getBoundingClientRect().height,
-      shapes:element.querySelectorAll('path,rect,circle,polygon').length,text:element.textContent
-    }));
-    expect(geometry.width).toBeGreaterThan(0);expect(geometry.height).toBeGreaterThan(0);expect(geometry.shapes).toBeGreaterThan(0);
-    expect(geometry.text).toContain(language==='navigation'?'ResourceList':language==='jobflow'?'Repository':'Running');
-    if(language==='navigation')expect(geometry.text).toContain('ResourceList(LoadError)');
-  }
-  await expect(diagram(page,'layout').locator('.layout-preview')).toHaveCount(2);
-  await expect(diagram(page,'layout').first().locator('.layout-component')).toContainText(['ListHeader','ResourceRows','RetryAction','ListFeedback']);
-  await expect(diagram(page,'layout').last().locator('.layout-component')).toContainText(['DetailHeader','DetailBody','ReturnAction']);
+  await expect(diagram(page,'jobflow').first().locator('svg')).toContainText('자료조회');
+  await expect(diagram(page,'jobflow').last().locator('svg')).toContainText('열기조율자');
   const observed=await observe(page);
-  expect(observed.svg).toBeGreaterThanOrEqual(3);
-  expect(observed.rawSource).toBe(false);
+  expect(observed.svg).toBeGreaterThanOrEqual(2);expect(observed.rawSource).toBe(false);
   expect(observed.documentWidth).toBeLessThanOrEqual(observed.viewport);
   for(const figure of observed.diagrams)expect(figure.width).toBeLessThanOrEqual(observed.viewport);
   const source=page.locator('details.document-source');
@@ -133,13 +121,38 @@ async function assertRepresentative(page) {
   return observed;
 }
 
+async function assertDedicatedDocuments(page,testInfo) {
+  for(const language of languageKinds){
+    const kind=language==='layout'?'screen_layout':language;
+    await page.locator('#document-kind-picker').selectOption(kind);
+    await expect(page.locator('.markdown')).toHaveAttribute('data-document-kind',kind);
+    await expect(page.locator('.markdown')).toHaveAttribute('data-render-state','ready');
+    await expect(diagram(page,language)).toHaveCount(language==='layout'?2:1);
+    for(const figure of await diagram(page,language).all())await expect(figure).toHaveAttribute('data-diagram-status','ready');
+    if(language==='layout'){
+      await expect(diagram(page,language).locator('.layout-preview')).toHaveCount(2);
+      await expect(diagram(page,language).first().locator('.layout-component')).toContainText(['ListHeader','ResourceRows','RetryAction','ListFeedback']);
+      await expect(diagram(page,language).last().locator('.layout-component')).toContainText(['DetailHeader','DetailBody','ReturnAction']);
+    }else{
+      const svg=diagram(page,language).locator('svg');
+      await expect(svg).toContainText(language==='navigation'?'ResourceList(LoadError)':language==='jobflow'?'Repository':'Running');
+      expect(await svg.evaluate(element=>element.getBoundingClientRect().height)).toBeGreaterThan(0);
+    }
+    const observed=await observe(page);expect(observed.rawSource).toBe(false);expect(observed.documentWidth).toBeLessThanOrEqual(observed.viewport);
+    await diagram(page,language).first().screenshot({path:testInfo.outputPath(`02-${language}.png`),animations:'disabled'});
+  }
+  await page.locator('#document-kind-picker').selectOption('architecture');
+  await expect(page.locator('.markdown')).toHaveAttribute('data-document-kind','architecture');
+  await expect(page.locator('.markdown')).toHaveAttribute('data-render-state','ready');
+}
+
 test('actual document preview renders Markdown and diagrams',async({server,productPage},testInfo)=>{
   const {page,violations,errors}=productPage;
   const unsafeAttempts=await watchUnsafeAttempts(page,server);
   await openDraft(server,page);
   await artifact(page,testInfo,'01-document-preview',await observe(page));
   await assertRepresentative(page);
-  for(const language of languageKinds)await diagram(page,language).first().screenshot({path:testInfo.outputPath(`02-${language}.png`),animations:'disabled'});
+  await assertDedicatedDocuments(page,testInfo);
   await page.locator('.markdown h1').scrollIntoViewIfNeeded();
   const refreshed=page.waitForResponse(response=>response.url()===`${server.origin}/api/v1/workspace`&&response.status()===200);
   await page.evaluate(()=>window.dispatchEvent(new Event('online')));await refreshed;
@@ -155,7 +168,7 @@ test('actual document preview renders Markdown and diagrams',async({server,produ
   expect(violations).toEqual([]);expect(errors).toEqual([]);
 });
 
-const hostileAppendix=[
+const hostileAppendix=(()=>{let fenced=false;return [
   '', '## 브라우저 안전성 검증', '',
   '일반 코드 예제는 실행하지 않고 그대로 읽을 수 있어야 한다.', '',
   '```html', '<script>window.architalkCodeProbe=true</script>', '<img src=x onerror="window.architalkCodeProbe=true">', '```', '',
@@ -168,7 +181,6 @@ const hostileAppendix=[
   '<svg onload="window.architalkDocumentProbe=true"><foreignObject><img src="https://document-rendering.invalid/foreign-image"></foreignObject><a xlink:href="javascript:window.architalkDocumentProbe=true"><text>위험한 SVG 링크</text></a></svg>',
   '<div id="scene-dialog" data-action="new-session"><button data-action="new-session">문서가 만든 작업 버튼</button><form id="start-form"><input name="content" value="임의 내용"></form></div>',
   '<a href="javascript:window.architalkDocumentProbe=true">위험한 링크</a>',
-  '[위험한 Markdown 링크](javascript:window.architalkDocumentProbe=true)',
   '![외부 Markdown 이미지](https://document-rendering.invalid/markdown-image)', '',
   ':::note title="코드와 그림이 있는 설명"', '중첩 예제도 본문과 같은 렌더 경계를 따른다.', '',
   '```javascript', 'const literal = ":::info";', '```', '',
@@ -180,7 +192,11 @@ const hostileAppendix=[
   'click Injected "javascript:window.architalkDocumentProbe=true"', '```', '',
   '### 잘못된 Mermaid', '', '```mermaid', 'flowchart LR', '  Broken["닫히지 않은 문법', '```', '',
   '## 오류 뒤에도 남는 본문', '', '**뒤쪽 본문 보존**과 일반 표·정상 diagram은 읽을 수 있어야 한다.', ''
-].join('\n');
+
+].map(line=>{
+  if(line.startsWith('```')){fenced=!fenced;return line;}
+  return !fenced&&line.startsWith('<')?`검증 입력: ${line}`:line;
+}).join('\n');})();
 
 async function assertHostileDocument(page,server) {
   await assertRepresentative(page);
@@ -210,6 +226,15 @@ async function assertHostileDocument(page,server) {
       executed:Boolean(window.architalkDocumentProbe||window.architalkCodeProbe),
       capabilityInMarkup:element.outerHTML.includes(sessionStorage.getItem('architalk.authorization'))};
   });
+  const markdownUrl=await page.evaluate(async()=>{
+    const {renderDocument}=await import('/document-renderer.js');
+    const probe=document.createElement('div');document.body.appendChild(probe);
+    try{
+      await renderDocument(probe,'[Markdown JavaScript URL](javascript:window.architalkDocumentProbe=true)');
+      return {links:probe.querySelectorAll('a').length,href:probe.querySelector('a')?.getAttribute('href'),executed:Boolean(window.architalkDocumentProbe)};
+    }finally{probe.remove();}
+  });
+  expect(markdownUrl).toEqual({links:1,href:null,executed:false});
   expect(unsafe).toEqual({attributes:[],controls:0,executed:false,capabilityInMarkup:false});
   expect((await server.workspace()).sessions).toHaveLength(1);
   return {unsafe,mermaid,normal};

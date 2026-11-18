@@ -313,6 +313,7 @@ fn readiness_requires_an_active_sourced_requirement_and_rechecks_exact_quotes() 
         id: id(),
         input_revision: s.design_revision,
         markdown: "# 설계".into(),
+        documents: vec![],
         hash: "hash".into(),
         created_at: now(),
         content_status: "draft".into(),

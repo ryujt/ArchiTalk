@@ -9,6 +9,8 @@ import { fixCjkEmphasis } from './diagrams/cjk-emphasis.js';
 import { preprocessSmartMd, applySmartTableSpecs } from './diagrams/smartmd.js';
 
 const generations = new WeakMap();
+const documentAnchors = new WeakMap();
+const documentLinkHandlers = new WeakMap();
 const diagramLanguages = new Set(['jobflow', 'layout', 'state', 'navigation', 'mermaid']);
 let mermaidModule;
 let mermaidQueue = Promise.resolve();
@@ -37,15 +39,86 @@ const mermaidConfig = {
   secure: ['securityLevel', 'startOnLoad', 'maxTextSize', 'maxEdges', 'suppressErrorRendering', 'htmlLabels', 'flowchart', 'state', 'themeCSS', 'themeVariables', 'dompurifyConfig', 'fontFamily', 'secure'],
 };
 
-function safeLinks(root) {
+export function headingSlug(title) {
+  return [...String(title).normalize('NFC').toLowerCase()].map((char) => /[\p{L}\p{N}_-]/u.test(char) ? char : /\s/u.test(char) ? '-' : '').join('');
+}
+
+function decodePart(value) {
+  try { return decodeURIComponent(value).normalize('NFC'); } catch { return null; }
+}
+
+/** Resolve package references without constructing a URL or requesting a file. */
+export function resolveDocumentTarget(href, documentLinks = [], currentDocument = 'architecture') {
+  const value = String(href || '').trim();
+  if (!value || /[\u0000-\u001f\u007f\\]/.test(value) || value.startsWith('//')) return null;
+  const hash = value.indexOf('#');
+  const file = decodePart(hash < 0 ? value : value.slice(0, hash));
+  const anchor = hash < 0 ? null : decodePart(value.slice(hash + 1));
+  if (file === null || (hash >= 0 && anchor === null) || /[\u0000-\u001f\u007f\\]/.test(file) || (anchor !== null && /[\u0000-\u001f\u007f]/.test(anchor))) return null;
+  if (file === '' && hash >= 0) return { kind: currentDocument, anchor: anchor.toLowerCase() };
+  const basename = file.startsWith('./') ? file.slice(2) : file;
+  if (!/^[^/\\?#\u0000-\u001f]+\.md$/iu.test(basename)) return null;
+  const match = (Array.isArray(documentLinks) ? documentLinks : []).find((entry) => entry && typeof entry.kind === 'string' && /^[a-z][a-z0-9_]*$/.test(entry.kind) && typeof entry.filename === 'string' && entry.filename.normalize('NFC') === basename);
+  return match ? { kind: match.kind, anchor: anchor === null ? null : anchor.toLowerCase() } : null;
+}
+
+function assignHeadingIds(root, prefix) {
+  const anchors = new Map();
+  for (const heading of root.querySelectorAll('h1,h2,h3,h4,h5,h6')) {
+    const base = headingSlug(heading.textContent);
+    let slug = base, duplicate = 0;
+    while (anchors.has(slug)) slug = `${base}-${++duplicate}`;
+    heading.id = `${prefix}-heading-${slug || 'section'}`;
+    anchors.set(slug, heading);
+  }
+  return anchors;
+}
+
+export function scrollToDocumentAnchor(container, anchor = '') {
+  if (!container.isConnected) return false;
+  const value = String(anchor).replace(/^#/, '').normalize('NFC');
+  const target = value === '' ? container : documentAnchors.get(container)?.get(value.toLowerCase());
+  if (!target) return false;
+  if (target !== container) { target.tabIndex = -1; target.focus?.({ preventScroll: true }); }
+  target.scrollIntoView?.({ block: 'start', inline: 'nearest', behavior: 'instant' });
+  return true;
+}
+
+function safeLinks(root, options, anchors) {
+  const localLinks = new WeakMap();
+  const kind = options.currentDocument || 'architecture';
   for (const link of root.querySelectorAll('a')) {
     const href = (link.getAttribute('href') || '').trim();
-    if (!/^(?:https?:\/\/|mailto:|#[A-Za-z0-9_-])/i.test(href) || /[\u0000-\u0020\u007f]/.test(href)) link.removeAttribute('href');
-    if (link.hasAttribute('href') && !href.startsWith('#')) {
+    if (/^(?:https?:\/\/|mailto:)/i.test(href) && !/[\u0000-\u0020\u007f]/.test(href)) {
       link.setAttribute('target', '_blank');
       link.setAttribute('rel', 'noopener noreferrer nofollow');
+      continue;
     }
+    const target = resolveDocumentTarget(href, options.documentLinks, kind);
+    if (!target || (target.kind !== kind && typeof options.onDocumentLink !== 'function')) { link.removeAttribute('href'); continue; }
+    const heading = target.kind === kind && target.anchor !== null ? anchors.get(target.anchor) : null;
+    link.setAttribute('href', heading ? `#${heading.id}` : '#');
+    link.classList.add('document-package-link');
+    localLinks.set(link, target);
   }
+  return localLinks;
+}
+
+function installDocumentLinks(container, localLinks, options, current) {
+  const previous = documentLinkHandlers.get(container);
+  if (previous) { container.removeEventListener('click', previous); container.removeEventListener('auxclick', previous); }
+  const listener = (event) => {
+    const link = event.target.closest?.('a');
+    const target = link && localLinks.get(link);
+    if (!target) return;
+    event.preventDefault();
+    if (!current() || event.type === 'auxclick') return;
+    if (target.kind === (options.currentDocument || 'architecture')) scrollToDocumentAnchor(container, target.anchor || '');
+    else options.onDocumentLink?.({ ...target });
+  };
+  container.addEventListener('click', listener);
+  container.addEventListener('auxclick', listener);
+  documentLinkHandlers.set(container, listener);
 }
 
 function sanitizeMarkdown(html) {
@@ -73,7 +146,6 @@ function sanitizeMarkdown(html) {
     if (classes.length) node.setAttribute('class', classes.join(' '));
     else node.removeAttribute('class');
   }
-  safeLinks(clean);
   return clean;
 }
 
@@ -264,9 +336,10 @@ async function fillDiagram(figure, diagram, prefix, current) {
 }
 
 /** Render untrusted Markdown/SmartMD in place. Returns when its local diagrams settle. */
-export async function renderDocument(container, markdown) {
+export async function renderDocument(container, markdown, options = {}) {
   const generation = (generations.get(container) || 0) + 1;
   generations.set(container, generation);
+  documentAnchors.delete(container);
   const current = () => generations.get(container) === generation && container.isConnected;
   container.classList.add('document-markdown');
   container.dataset.renderState = 'loading';
@@ -280,6 +353,8 @@ export async function renderDocument(container, markdown) {
     const parser = parserFor(slots, token);
     const transformed = preprocessSmartMd(source, (inner) => parser.parse(inner));
     const fragment = sanitizeMarkdown(parser.parse(fixOutsideFences(transformed)));
+    const anchors = assignHeadingIds(fragment, prefix);
+    const localLinks = safeLinks(fragment, options, anchors);
     const pending = [];
     for (const placeholder of fragment.querySelectorAll('pre.document-diagram-slot')) {
       const diagram = slots.get(placeholder.textContent);
@@ -296,8 +371,13 @@ export async function renderDocument(container, markdown) {
       pending.push({ figure, diagram, prefix: `${prefix}-diagram-${pending.length}` });
     }
     container.replaceChildren(fragment);
+    documentAnchors.set(container, anchors);
+    installDocumentLinks(container, localLinks, options, current);
     await Promise.all(pending.map(({ figure, diagram, prefix: id }) => fillDiagram(figure, diagram, id, current)));
-    if (current()) { container.dataset.renderState = 'ready'; container.setAttribute('aria-busy', 'false'); }
+    if (current()) {
+      container.dataset.renderState = 'ready'; container.setAttribute('aria-busy', 'false');
+      if (options.anchor !== undefined && options.anchor !== null) scrollToDocumentAnchor(container, options.anchor);
+    }
   } catch (error) {
     if (!current()) return;
     container.replaceChildren();

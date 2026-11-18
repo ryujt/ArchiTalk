@@ -6,6 +6,9 @@ import {spawn} from 'node:child_process';
 import {once} from 'node:events';
 
 const repo=resolve(new URL('../..',import.meta.url).pathname);
+// A frozen build makes every case use the same binary while other agents run
+// Rust checks. This is a test-runner override, never product configuration.
+const binary=process.env.ARCHITALK_BROWSER_BINARY?resolve(process.env.ARCHITALK_BROWSER_BINARY):join(repo,'target/debug/architalk');
 const redact=text=>String(text).replace(/#token=[^\s]+/g,'#token=[redacted]').replace(/[a-f0-9]{64}/g,'[redacted]');
 
 async function startServer() {
@@ -16,13 +19,14 @@ async function startServer() {
   const executable=join(tools,'fixture-cli.py');
   await copyFile(join(repo,'tests/fixtures/claude-workflow.py'),executable);
   await copyFile(join(repo,'tests/fixtures/architecture.smart.md'),join(tools,'architecture.smart.md'));
+  await copyFile(join(repo,'tests/fixtures/design-package.json'),join(tools,'design-package.json'));
   await chmod(executable,0o700);
   await writeFile(join(project,'README.md'),'# Browser test project\nSynthetic local notification design.\n');
   const config=join(tools,'config.toml');
   await writeFile(config,`[ai]\ndefault_backend = "claude"\ntimeout_seconds = 30\n[ai.backends.claude]\nexecutable = ${JSON.stringify(executable)}\n[ai.backends.codex]\nexecutable = ${JSON.stringify(executable)}\n[documents]\ndirectory = "docs/architecture"\nlanguage = "ko"\n`);
   // Both configured executables are the copied fixture. Browser tests cannot
   // reach a real model even if a backend selection regresses.
-  const child=spawn(join(repo,'target/debug/architalk'),['--no-open','--port','0','--project',project,'--config',config],{
+  const child=spawn(binary,['--no-open','--port','0','--project',project,'--config',config],{
     cwd:repo,env:{...process.env,RUST_LOG:'architalk=warn'},stdio:['ignore','pipe','pipe']
   });
   let output='',errors='';
@@ -48,7 +52,15 @@ async function startServer() {
     ...endpoint,project,
     async configureDocumentFixture(markdown){
       if(typeof markdown!=='string'||Buffer.byteLength(markdown)>500_000)throw new Error('Invalid isolated document fixture.');
-      await writeFile(join(tools,'architecture.smart.md'),markdown);
+      const packagePath=join(tools,'design-package.json');
+      const candidate=JSON.parse(await readFile(packagePath,'utf8'));
+      candidate.markdown=markdown;
+      await writeFile(packagePath,JSON.stringify(candidate));
+    },
+    async configurePackageFixture(candidate){
+      const text=JSON.stringify(candidate);
+      if(Buffer.byteLength(text)>900_000)throw new Error('Isolated package fixture is too large.');
+      await writeFile(join(tools,'design-package.json'),text);
     },
     async configureSlowFixture(seconds=2){
       if(!Number.isFinite(seconds)||seconds<=0||seconds>30)throw new Error('Fixture delay must be between 0 and 30 seconds.');

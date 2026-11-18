@@ -1,4 +1,6 @@
 import {test,expect} from './fixtures.mjs';
+import {createHash} from 'node:crypto';
+import {basename} from 'node:path';
 
 async function noOverflow(page) {
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
@@ -56,24 +58,31 @@ test('real local UI persists a draft, next-run settings and recovery without mod
   await expect(page.getByRole('dialog')).toBeVisible();
   await expect(page.locator('[data-action="export-apply"]')).toBeEnabled();
   await expect(page.locator('[data-action="approve-export"]')).toHaveCount(0);
-  await expect(page.locator('.plan-file')).toContainText('아키텍처-설계.md');
+  await expect(page.locator('.plan-file')).toHaveCount(10);
+  await expect(page.locator('.plan-file').first()).toContainText('아키텍처-설계.md');
   await noOverflow(page);
-  await page.getByRole('button',{name:'초안으로 저장',exact:true}).click();
+  await page.getByRole('button',{name:'전체 10개를 초안으로 저장',exact:true}).click();
   await expect(page.getByRole('heading',{name:'설계 문서를 저장했어요'})).toBeVisible();
   const saved=await server.workspace();
   const exported=saved.exports.at(-1);
   expect(exported.status).toBe('completed');expect(exported.result.status).toBe('completed');
-  expect(exported.result.paths).toHaveLength(1);
-  const bytes=await server.savedFile(exported.result.paths[0]);
-  expect(bytes.startsWith('---\n')).toBe(true);
-  expect(bytes.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)?.[1]).toMatch(/^style:\s*smartmd$/m);
-  for(const language of ['navigation','jobflow','state','layout']){
-    expect(bytes).toMatch(new RegExp('^```'+language+'\\n[\\s\\S]+?\\n```','m'));
+  expect(exported.result.paths).toHaveLength(10);
+  expect(exported.plan.files).toHaveLength(10);
+  expect(exported.result.paths.map(path=>basename(path))).toEqual(saved.document_types.map(type=>type.filename));
+  const stored=new Map();
+  for(const path of exported.result.paths){
+    const name=basename(path),bytes=await server.savedFile(path);stored.set(name,bytes);
+    expect(bytes.startsWith('---\n')).toBe(true);expect(bytes).toMatch(/^style:\s*smartmd$/m);
+    const planned=exported.plan.files.find(file=>file.relative_path===name);
+    expect(bytes).toBe(planned.content);
+    expect(createHash('sha256').update(bytes).digest('hex')).toBe(planned.hash);
   }
-  expect(bytes).toMatch(/^:::info title="[^"]+"\n[\s\S]+?^:::$/m);
-  expect(bytes).toMatch(/^\{table .+\}\n\n\|.+\|\n\|[ |:-]+\|/m);
-  expect(bytes).toContain('# 알림 서비스 아키텍처');
-  expect(bytes).toContain('내용 상태: draft');
+  const bytes=stored.get('아키텍처-설계.md');
+  for(const section of ['Method-R macro design','Method-R system design','Method-R module design','Method-R detailed design'])expect(bytes).toContain(`## ${section}`);
+  for(const type of saved.document_types.slice(1))expect(bytes).toContain(`](${type.filename})`);
+  for(const [name,language] of [['네비게이션.md','navigation'],['잡플로우.md','jobflow'],['상태도.md','state'],['화면설계.md','layout']])expect(stored.get(name)).toContain('```'+language+'\n');
+  expect(stored.get('네비게이션.md')).toContain('화면설계.md#resource-list');
+  expect(bytes).toContain('# 알림 서비스 아키텍처');expect(bytes).toContain('내용 상태: draft');
   expect(saved.sessions[0].content_status).not.toBe('approved');
   await screenshot(page,testInfo,'03-saved');
   const originalRuns=structuredClone(saved.runs);

@@ -142,6 +142,11 @@ export function safeRelativeDirectory(path) {
 export function settingsFromValues(current, values) {
   const settings = structuredClone(current);
   const value = name => String(values[name] || '').trim() || null;
+  if (Object.hasOwn(values, 'timeout-seconds')) {
+    const timeout = Number(values['timeout-seconds']);
+    if (!Number.isInteger(timeout) || timeout < 10 || timeout > 600) throw new ApiError(400, {error:{code:'INVALID_SETTINGS',message:'작업 시간 제한은 10~600초 사이의 정수로 입력해 주세요.'}});
+    settings.ai.timeout_seconds = timeout;
+  }
   settings.ai.default_backend = value('default-backend');
   for (const backend of ['claude','codex']) {
     settings.ai.backends[backend].model = value(backend+'-model');
@@ -169,6 +174,28 @@ function button(action, label, cls = 'secondary', disabled = false, extra = '') 
   return `<button type="button" class="${cls}" data-action="${action}"${disabled ? ' disabled' : ''}${extra}>${label}</button>`;
 }
 
+const LEGACY_DOCUMENT_TYPE = Object.freeze({ kind: 'architecture', filename: '아키텍처-설계.md', title: '아키텍처 설계' });
+
+/** Server-owned kinds and filenames are the only package navigation targets. */
+export function documentsForDraft(workspace, currentDraft) {
+  if (!currentDraft) return [];
+  const seenKinds = new Set(), seenFiles = new Set();
+  const catalog = list(workspace?.document_types).filter((entry) => {
+    if (!entry || typeof entry.kind !== 'string' || !/^[a-z][a-z0-9_]*$/.test(entry.kind) || typeof entry.filename !== 'string' || !/^[^/\\?#\u0000-\u001f]+\.md$/iu.test(entry.filename) || typeof entry.title !== 'string') return false;
+    const filename = entry.filename.normalize('NFC');
+    if (seenKinds.has(entry.kind) || seenFiles.has(filename)) return false;
+    seenKinds.add(entry.kind); seenFiles.add(filename); return true;
+  });
+  const primary = catalog.find((entry) => entry.kind === 'architecture') || LEGACY_DOCUMENT_TYPE;
+  const documents = [{ ...primary, markdown: typeof currentDraft.markdown === 'string' ? currentDraft.markdown : '' }];
+  for (const type of catalog) {
+    if (type.kind === 'architecture') continue;
+    const document = list(currentDraft.documents).find((entry) => entry?.kind === type.kind && typeof entry.markdown === 'string');
+    if (document) documents.push({ ...type, markdown: document.markdown });
+  }
+  return documents;
+}
+
 export function startWorkspace(doc = document, win = window) {
   const $ = id => doc.getElementById(id);
   let storage;
@@ -177,7 +204,7 @@ export function startWorkspace(doc = document, win = window) {
   const api = createApi(token, win.fetch.bind(win));
   const state = {
     workspace: null, session: null, run: null, scene: 'loading', panel: 'notes',
-    selectedDraft: null, busy: false, error: null, notice: '', live: '', progress: '',
+    selectedDraft: null, selectedDocument: 'architecture', documentAnchor: null, busy: false, error: null, notice: '', live: '', progress: '',
     connection: 'connecting', modal: null, modalError: '', settings: null,
     diagnostics: null, choices: {}, settingsRevision: null, plan: null, saved: null,
     answer: '', intro: '', cursor: '', feed: null, refreshTimer: null, diagnosticTimer: null,
@@ -189,6 +216,13 @@ export function startWorkspace(doc = document, win = window) {
   let documentPreview = null, documentRenderer = null;
   const dialog = $('scene-dialog');
   const draft = () => list(state.session?.drafts).find(d => d.id === state.selectedDraft) || list(state.session?.drafts).at(-1);
+  const availableDocuments = () => documentsForDraft(state.workspace, draft());
+  const selectedDocument = () => {
+    const documents = availableDocuments();
+    const selected = documents.find((item) => item.kind === state.selectedDocument) || documents[0];
+    if (selected) state.selectedDocument = selected.kind;
+    return selected;
+  };
   const approvalIssues = () => draft()?.id === list(state.session?.drafts).at(-1)?.id && Array.isArray(state.session?.readiness_issues) ? state.session.readiness_issues : approvalBlockers(state.session,draft());
   const canApprove = () => !approvalIssues().length && !runIsActive(state.run) && !unknownTermination(state.run);
   const globalRun = () => state.workspace?.active_run;
@@ -365,7 +399,7 @@ export function startWorkspace(doc = document, win = window) {
     if (state.busy) return;
     state.requestEpoch++;
     state.feed?.abort(); state.feed = null; state.cursor = ''; state.run = null;
-    state.selectedDraft = null; state.answer = ''; state.error = null; state.saved=null; state.lastExport=null;
+    state.selectedDraft = null; state.selectedDocument = 'architecture'; state.documentAnchor = null; state.answer = ''; state.error = null; state.saved=null; state.lastExport=null;
     await command(async () => {
       const session = await api(`${API_ROOT}sessions/${idPath(id)}`);
       state.session = session.session || session;
@@ -428,24 +462,50 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function renderDocumentPreview(content) {
-    const target=content.querySelector?.('[data-document-preview]');
-    if (!target) { documentPreview=null; return; }
-    const current=draft();
-    if (!current) return;
-    if (documentPreview?.sessionId===state.session.id && documentPreview.draftId===current.id && documentPreview.markdown===current.markdown) {
-      target.replaceWith(documentPreview.node);
+    const target = content.querySelector?.('[data-document-preview]');
+    if (!target) { documentPreview = null; return; }
+    const current = draft(), document = selectedDocument();
+    if (!current || !document) return;
+    const documents = availableDocuments();
+    const documentLinks = documents.map(({kind, filename}) => ({kind, filename}));
+    const catalogKey = JSON.stringify(documentLinks);
+    const anchor = state.documentAnchor;
+    state.documentAnchor = null;
+    const sessionId = state.session.id, draftId = current.id;
+    if (documentPreview?.sessionId === sessionId && documentPreview.draftId === draftId && documentPreview.kind === document.kind && documentPreview.markdown === document.markdown && documentPreview.catalogKey === catalogKey) {
+      const preview = documentPreview;
+      target.replaceWith(preview.node);
+      if (anchor !== null) void preview.ready?.then(async () => {
+        const { scrollToDocumentAnchor } = await documentRenderer;
+        if (!state.disposed && preview.node.isConnected && state.session?.id === sessionId && draft()?.id === draftId && state.selectedDocument === preview.kind) scrollToDocumentAnchor(preview.node, anchor);
+      });
       return;
     }
-    documentPreview={sessionId:state.session.id,draftId:current.id,markdown:current.markdown,node:target};
+    const preview = {sessionId, draftId, kind: document.kind, markdown: document.markdown, catalogKey, node: target};
+    documentPreview = preview;
     documentRenderer ||= import('./document-renderer.js');
-    void documentRenderer.then(({renderDocument})=> {
-      if (!state.disposed && target.isConnected) return renderDocument(target,current.markdown);
-    }).catch(()=> {
+    preview.ready = documentRenderer.then(({renderDocument}) => {
+      if (!state.disposed && target.isConnected) return renderDocument(target, document.markdown, {
+        documentLinks, currentDocument: document.kind, anchor,
+        onDocumentLink: ({kind, anchor: destination}) => {
+          if (state.session?.id === sessionId && draft()?.id === draftId && target.isConnected) selectDocument(kind, destination);
+        },
+      });
+    }).catch(() => {
       if (!state.disposed && target.isConnected) {
-        target.dataset.renderState='error'; target.setAttribute('aria-busy','false');
-        target.textContent='문서를 표시하지 못했어요. 아래의 Markdown 원문을 확인하거나 화면을 새로고침해 주세요.';
+        target.dataset.renderState = 'error'; target.setAttribute('aria-busy', 'false');
+        target.textContent = '문서를 표시하지 못했어요. 아래의 Markdown 원문을 확인하거나 화면을 새로고침해 주세요.';
       }
     });
+  }
+
+  function selectDocument(kind, anchor = null) {
+    if (!availableDocuments().some((document) => document.kind === kind)) return;
+    state.selectedDocument = kind;
+    state.documentAnchor = anchor ?? '';
+    if (runIsActive(state.run)) { state.runScene = 'review'; state.scene = 'generating'; }
+    else state.scene = 'review';
+    state.notice = ''; render();
   }
 
   function inDocumentPreview(target) {
@@ -517,8 +577,10 @@ export function startWorkspace(doc = document, win = window) {
   function review(pending = false) {
     const currentDraft = draft(), current = draftIsCurrent(state.session,currentDraft);
     const approved = currentDraft.content_status === 'approved';
-    const issues = approvalIssues();
-    return `<p class="intro">완성된 초안을 살펴보고, 바꾸고 싶은 내용은 대화로 들려주세요.</p><article class="document-preview"><div class="document-toolbar"><span>▤ 아키텍처 설계</span><select class="draft-picker" id="draft-picker" aria-label="초안 버전 선택">${list(state.session.drafts).map((item,i)=>`<option value="${esc(item.id)}"${item.id===currentDraft.id?' selected':''}>초안 ${i+1} · 설계 기록 ${esc(item.input_revision)}</option>`).join('')}</select><span>${approved?'검토본':current?'현재 대화 기준 초안':'이전 대화 기준 초안'}</span></div><div class="document-paper"><p class="doc-label">설계 기록 ${esc(currentDraft.input_revision)} 기준${current?' · 현재 대화와 일치':' · 새 답변 반영 필요'}</p><div class="markdown" data-document-preview data-render-state="loading" aria-busy="true"><p role="status">문서를 표시하고 있어요…</p></div><details class="document-source"><summary>Markdown 원문 보기</summary><pre>${esc(currentDraft.markdown)}</pre></details></div></article>${findings()}${issues.length?`<details class="warning-box"><summary>검토본 확정 전에 확인할 내용 · ${issues.length}개</summary><ul>${issues.map(issue=>`<li>${esc(issue)}</li>`).join('')}</ul></details>`:''}<div class="review-actions"><p class="review-note">내용 확정과 파일 저장은 별개예요.<br>${approved?'현재 설계 기록의 내용을 검토본으로 확정했어요.':current?'초안으로 저장하면 가정과 미정을 그대로 남겨요.':'이전 초안을 그대로 저장할 수 있어요. 현재 버전 확정은 다시 정리한 뒤 가능해요.'}</p><div class="button-row">${button('approve',approved?'검토본 확정됨':'이 버전을 검토본으로 확정','secondary',state.busy||approved||!canApprove())}${button('save-preview','문서에 반영 ↗','primary',state.busy||runIsActive(state.run))}</div></div>${pending?pendingMessage():''}${composer()}${button('interview','대화 기록 살펴보기','quiet-button')}`;
+    const issues = approvalIssues(), documents = availableDocuments(), document = selectedDocument();
+    const count = documents.length, packaged = count > 1;
+    const approveLabel = approved ? packaged ? `전체 ${count}개 검토본 확정됨` : '검토본 확정됨' : packaged ? `전체 ${count}개 문서를 검토본으로 확정` : '이 버전을 검토본으로 확정';
+    return `<p class="intro">${packaged ? `같은 초안의 ${count}개 설계 문서를 살펴보고, 바꾸고 싶은 내용은 대화로 들려주세요.` : '완성된 초안을 살펴보고, 바꾸고 싶은 내용은 대화로 들려주세요.'}</p><article class="document-preview"><div class="document-toolbar"><label class="document-kind-control" for="document-kind-picker"><span>문서 종류 · ${count}개</span><select id="document-kind-picker" class="document-kind-picker" aria-label="문서 종류 선택">${documents.map((item) => `<option value="${esc(item.kind)}"${item.kind === document.kind ? ' selected' : ''}>${esc(item.title)}</option>`).join('')}</select></label><label class="document-version-control" for="draft-picker"><span>초안 버전</span><select class="draft-picker" id="draft-picker" aria-label="초안 버전 선택">${list(state.session.drafts).map((item,i)=>`<option value="${esc(item.id)}"${item.id===currentDraft.id?' selected':''}>초안 ${i+1} · 설계 기록 ${esc(item.input_revision)}</option>`).join('')}</select></label><span class="document-version-status">${approved?'검토본':current?'현재 대화 기준 초안':'이전 대화 기준 초안'}</span></div><div class="document-paper"><p class="doc-label">${esc(document.filename)} · 설계 기록 ${esc(currentDraft.input_revision)} 기준${current?' · 현재 대화와 일치':' · 새 답변 반영 필요'}</p><div class="markdown" data-document-preview data-document-kind="${esc(document.kind)}" data-render-state="loading" aria-busy="true"><p role="status">문서를 표시하고 있어요…</p></div><details class="document-source"><summary>현재 문서의 Markdown 원문 보기</summary><pre>${esc(document.markdown)}</pre></details></div></article>${findings()}${issues.length?`<details class="warning-box"><summary>검토본 확정 전에 확인할 내용 · ${issues.length}개</summary><ul>${issues.map(issue=>`<li>${esc(issue)}</li>`).join('')}</ul></details>`:''}<div class="review-actions"><p class="review-note">${packaged ? `문서 선택은 보기에만 적용돼요. 이 초안의 ${count}개 문서를 함께 확정·저장해요.` : '이 초안의 아키텍처 설계 문서 1개를 확정·저장해요.'}<br>${approved?'현재 설계 기록의 내용을 검토본으로 확정했어요.':current?'내용 확정과 파일 저장은 별개예요. 초안으로 저장하면 가정과 미정을 그대로 남겨요.':'이전 초안을 그대로 저장할 수 있어요. 현재 버전 확정은 다시 정리한 뒤 가능해요.'}</p><div class="button-row">${button('approve',approveLabel,'secondary',state.busy||approved||!canApprove())}${button('save-preview',packaged ? `전체 ${count}개 문서 반영 ↗` : '문서에 반영 ↗','primary',state.busy||runIsActive(state.run))}</div></div>${pending?pendingMessage():''}${composer()}${button('interview','대화 기록 살펴보기','quiet-button')}`;
   }
 
   function findings() {
@@ -548,7 +610,7 @@ export function startWorkspace(doc = document, win = window) {
 
   function saved() {
     const result = state.saved || {}, files = list(result.paths);
-    return `<section class="status-card"><div class="status-icon" aria-hidden="true">✓</div><h1>설계 문서를 저장했어요</h1><p>서버가 파일 저장을 확인했어요. 다음에 반영할 때도 새 개정 폴더를 사용해요.</p><div class="saved-path"><span>이번에 저장한 문서</span>${files.length?files.map(file=>`<strong>${esc(typeof file==='string'?file:file.path || file.relative_path)}</strong>`).join(''):`<strong>${esc(result.path || result.directory || result.bundle_path || '')}</strong>`}</div><div class="button-row">${button('review','문서 살펴보기','primary')}${button('interview','대화 이어가기')}</div></section>`;
+    return `<section class="status-card"><div class="status-icon" aria-hidden="true">✓</div><h1>설계 문서를 저장했어요</h1><p>서버가 ${files.length > 1 ? `전체 ${files.length}개 문서의 ` : ''}파일 저장을 확인했어요. 다음에 반영할 때도 새 개정 폴더를 사용해요.</p><div class="saved-path"><span>이번에 저장한 문서</span>${files.length?files.map(file=>`<strong>${esc(typeof file==='string'?file:file.path || file.relative_path)}</strong>`).join(''):`<strong>${esc(result.path || result.directory || result.bundle_path || '')}</strong>`}</div><div class="button-row">${button('review','문서 살펴보기','primary')}${button('interview','대화 이어가기')}</div></section>`;
   }
 
   function renderAux() {
@@ -558,7 +620,8 @@ export function startWorkspace(doc = document, win = window) {
     }
     $('aux-content').setAttribute('aria-labelledby',state.panel+'-tab');
     if (state.panel === 'documents') {
-      $('aux-content').innerHTML = `<div class="panel-heading"><h3>설계 문서</h3><span class="mini-label">${draft()?'초안 있음':'미생성'}</span></div>${draft()?`<button type="button" class="document-item" data-action="inspect-draft"><span class="document-icon" aria-hidden="true">▤</span><span><b>아키텍처 설계</b><small>설계 기록 ${esc(draft().input_revision)} · ${draftIsCurrent(state.session,draft())?'현재 대화 기준':'이전 대화 기준'}</small></span></button>`:`<p class="context-intro">대화를 시작하고 ‘현재 답변으로 초안 만들기’를 선택하면 여기에 완성된 초안이 표시돼요.</p>`}<p class="context-intro">문서에 반영하기 전까지 프로젝트 파일은 바뀌지 않아요.</p>`;
+      const documents = availableDocuments(), selected = selectedDocument();
+      $('aux-content').innerHTML = `<div class="panel-heading"><h3>설계 문서</h3><span class="mini-label">${draft()?`${documents.length}개 문서`:'미생성'}</span></div>${draft()?documents.map((document) => `<button type="button" class="document-item${document.kind === selected?.kind ? ' selected' : ''}" data-action="inspect-document" data-document-kind="${esc(document.kind)}"${document.kind === selected?.kind ? ' aria-current="page"' : ''}><span class="document-icon" aria-hidden="true">▤</span><span><b>${esc(document.title)}</b><small>${esc(document.filename)}<br>설계 기록 ${esc(draft().input_revision)} · ${draftIsCurrent(state.session,draft())?'현재 대화 기준':'이전 대화 기준'}</small></span></button>`).join(''):`<p class="context-intro">대화를 시작하고 ‘현재 답변으로 초안 만들기’를 선택하면 여기에 완성된 초안이 표시돼요.</p>`}<p class="context-intro">문서 선택은 보기에만 적용돼요. 반영할 때는 같은 초안의 문서를 모두 저장해요.</p>`;
       return;
     }
     const session=state.session;
@@ -619,7 +682,7 @@ export function startWorkspace(doc = document, win = window) {
 
   function settingsModal() {
     const settings = state.settings || {}, ai = settings.ai || {}, backends = ai.backends || {};
-    return `${header('답변에 사용할 도구')}<div class="dialog-body"><p>로컬 Claude Code 또는 Codex의 기존 로그인을 사용해요. 설치·help 진단은 로그인이나 모델 응답을 시험하지 않아요.</p><div id="modal-error">${modalError()}</div><form id="settings-form"><div class="form-field"><label for="default-backend">기본 도구</label><select id="default-backend" name="default-backend">${['claude','codex'].map(kind=>`<option value="${kind}"${(ai.default_backend||'claude')===kind?' selected':''}>${kind==='claude'?'Claude Code':'Codex'}</option>`).join('')}</select></div><div class="diagnostics" id="cli-diagnostics">${diagnosticsHTML()}</div>${button('diagnose','설치·버전 진단','secondary',state.busy)}${['claude','codex'].map(kind=>{
+    return `${header('답변에 사용할 도구')}<div class="dialog-body"><p>로컬 Claude Code 또는 Codex의 기존 로그인을 사용해요. 설치·help 진단은 로그인이나 모델 응답을 시험하지 않아요.</p><div id="modal-error">${modalError()}</div><form id="settings-form"><div class="form-field"><label for="default-backend">기본 도구</label><select id="default-backend" name="default-backend">${['claude','codex'].map(kind=>`<option value="${kind}"${(ai.default_backend||'claude')===kind?' selected':''}>${kind==='claude'?'Claude Code':'Codex'}</option>`).join('')}</select></div><div class="form-field"><label for="timeout-seconds">작업 시간 제한(초)</label><input id="timeout-seconds" name="timeout-seconds" type="number" min="10" max="600" step="1" required value="${esc(ai.timeout_seconds ?? '')}" aria-describedby="timeout-seconds-help"><small id="timeout-seconds-help">각 AI 요청을 기다리는 시간을 10~600초 사이의 정수로 설정해요. 변경은 다음 작업부터 적용돼요.</small></div><div class="diagnostics" id="cli-diagnostics">${diagnosticsHTML()}</div>${button('diagnose','설치·버전 진단','secondary',state.busy)}${['claude','codex'].map(kind=>{
       const base=backends[kind] || {};
       return `<section class="settings-section"><h3>${kind==='claude'?'Claude Code':'Codex'} 기본 설정</h3><div class="form-field"><label for="${kind}-executable">신뢰된 실행 파일</label><input id="${kind}-executable" readonly value="${esc(base.executable || kind)}"><small>실행 파일 변경은 터미널의 사용자 전역 설정에서 해 주세요.</small></div>${kind==='codex'?`<div class="form-field"><label for="codex-profile">Codex profile</label><input id="codex-profile" readonly value="${esc(base.profile || 'CLI 기본 profile')}"><small>신뢰된 사용자 전역 설정의 profile을 사용해요.</small></div>`:''}<div class="field-grid">${settingField(kind,'model',base.model,kind)}${settingField(kind,'effort',base.effort,kind)}</div><p class="capability-note">목록은 알려진 값의 예시예요. 계정·CLI·모델별 사용 가능 여부는 실제 요청에서 확인돼요. 목록에 없는 값도 직접 입력할 수 있어요.</p></section>`;
     }).join('')}<details class="settings-section" open><summary>역할마다 다르게 설정하기 · 선택</summary>${['conversation','design','critic'].map((role,i)=>{
@@ -636,8 +699,8 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function saveModal() {
-    const plan = state.plan, files = list(plan?.files);
-    return `${header('문서에 반영하기')}<div class="dialog-body"><p>저장할 폴더와 내용을 확인해 주세요. 기존 문서를 보존하고 새 개정 폴더에 저장해요.</p><div id="modal-error">${modalError()}</div><form id="save-form"><div class="form-field"><label for="output-directory">저장 폴더 · 프로젝트 기준 상대 경로</label><input id="output-directory" name="directory" value="${esc(plan?.relative_directory || '')}" placeholder="비우면 프로젝트 이름으로 제안해요"><small>폴더를 바꾸면 다시 미리보기를 확인해 주세요.</small></div><button type="submit" class="secondary"${state.busy?' disabled':''}>저장 내용 미리보기</button></form>${plan?`<div class="diff"><div class="diff-header"><span>새 문서 · 설계 기록 ${esc(plan.document_revision ?? draft()?.input_revision)}</span><span>${draftIsCurrent(state.session,draft())?'현재':'이전'} 대화 기준</span></div>${files.map(file=>`<div class="plan-file diff-line"><b>＋ ${esc(typeof file==='string'?file:`${plan.relative_directory}/${file.relative_path}`)}</b>${file.content || file.preview?`<pre>${esc(file.content || file.preview)}</pre>`:''}</div>`).join('')}${!files.length?`<div class="diff-line">${esc(plan.path || plan.bundle_path || plan.directory)}</div>`:''}</div><div class="inline-notice">내용 상태: ${draft()?.content_status==='approved'?'검토본':'초안'} · 파일 저장과 내용 확정은 별개예요.</div><div class="dialog-footer">${button('close-modal','검토로 돌아가기','quiet-button',state.busy)}<div class="button-row">${button('export-apply',draft()?.content_status==='approved'?'검토본으로 저장':'초안으로 저장','primary',state.busy)}${canApprove()&&draft()?.content_status!=='approved'?button('approve-export','검토본으로 확정하고 저장','secondary',state.busy):''}</div></div>`:''}</div>`;
+    const plan = state.plan, files = list(plan?.files), count = plan ? files.length : availableDocuments().length, packaged = count > 1;
+    return `${header(packaged ? '전체 문서에 반영하기' : '문서에 반영하기')}<div class="dialog-body"><p>${packaged ? `지금 보고 있는 문서와 함께 이 초안의 전체 ${count}개 문서를 저장해요. ` : ''}저장할 폴더와 내용을 확인해 주세요. 기존 문서를 보존하고 새 개정 폴더에 저장해요.</p><div id="modal-error">${modalError()}</div><form id="save-form"><div class="form-field"><label for="output-directory">저장 폴더 · 프로젝트 기준 상대 경로</label><input id="output-directory" name="directory" value="${esc(plan?.relative_directory || '')}" placeholder="비우면 프로젝트 이름으로 제안해요"><small>폴더를 바꾸면 다시 미리보기를 확인해 주세요.</small></div><button type="submit" class="secondary"${state.busy?' disabled':''}>저장 내용 미리보기</button></form>${plan?`<div class="diff"><div class="diff-header"><span>전체 ${files.length}개 문서 · 설계 기록 ${esc(plan.document_revision ?? draft()?.input_revision)}</span><span>${draftIsCurrent(state.session,draft())?'현재':'이전'} 대화 기준</span></div>${files.map(file=>`<div class="plan-file diff-line"><b>＋ ${esc(typeof file==='string'?file:`${plan.relative_directory}/${file.relative_path}`)}</b>${file.content || file.preview?`<pre>${esc(file.content || file.preview)}</pre>`:''}</div>`).join('')}${!files.length?`<div class="diff-line">${esc(plan.path || plan.bundle_path || plan.directory)}</div>`:''}</div><div class="inline-notice">저장 대상: 이 초안의 전체 ${files.length}개 문서 · 내용 상태: ${draft()?.content_status==='approved'?'검토본':'초안'}<br>파일 저장과 내용 확정은 별개예요.</div><div class="dialog-footer">${button('close-modal','검토로 돌아가기','quiet-button',state.busy)}<div class="button-row">${button('export-apply',packaged ? `전체 ${count}개를 ${draft()?.content_status==='approved'?'검토본':'초안'}으로 저장` : draft()?.content_status==='approved'?'검토본으로 저장':'초안으로 저장','primary',state.busy)}${canApprove()&&draft()?.content_status!=='approved'?button('approve-export',packaged ? `전체 ${count}개를 확정하고 저장` : '검토본으로 확정하고 저장','secondary',state.busy):''}</div></div>`:''}</div>`;
   }
 
   function closeModal() {
@@ -712,7 +775,7 @@ export function startWorkspace(doc = document, win = window) {
   function newSession() {
     if (state.busy) return;
     state.requestEpoch++; state.feed?.abort(); state.feed=null;
-    state.session=null; state.run=null; state.scene='welcome'; state.selectedDraft=null;
+    state.session=null; state.run=null; state.scene='welcome'; state.selectedDraft=null; state.selectedDocument='architecture'; state.documentAnchor=null;
     state.error=null; state.notice=''; state.cursor=''; state.answer=''; state.saved=null; state.lastExport=null;
     state.intro=''; state.contextPaths.clear();
     rememberSession(storage,null); render(); $('project-intro')?.focus();
@@ -724,6 +787,7 @@ export function startWorkspace(doc = document, win = window) {
     if (target.dataset.session) { void selectSession(target.dataset.session); return; }
     if (target.dataset.panel) { state.panel=target.dataset.panel; renderAux(); return; }
     const action=target.dataset.action;
+    if (action==='inspect-document') { selectDocument(target.dataset.documentKind); return; }
     if (action==='settings') { void openSettings(target); return; }
     if (action==='new-session') { newSession(); return; }
     if (action==='close-modal') { closeModal(); return; }
@@ -836,8 +900,8 @@ export function startWorkspace(doc = document, win = window) {
       },{modal:true});
     } else {
       const values = Object.fromEntries(new FormData(form));
-      const settings = settingsFromValues(state.settings, values);
       void command(async()=> {
+        const settings = settingsFromValues(state.settings, values);
         const result=await api(`${API_ROOT}settings`,{method:'PATCH',body:envelope({settings},state.settingsRevision)});
         state.settings=result.settings || settings; state.settingsRevision=result.revision;
         state.modal=null; delete dialog.dataset.modal; dialog.close(); state.notice='도구 설정을 저장했어요. 다음 생성부터 적용돼요.';
@@ -867,7 +931,8 @@ export function startWorkspace(doc = document, win = window) {
     }
     if (event.target.name==='context-path') event.target.checked?state.contextPaths.add(event.target.value):state.contextPaths.delete(event.target.value);
     if (event.target.id==='session-switcher') event.target.value?void selectSession(event.target.value):newSession();
-    if (event.target.id==='draft-picker') { state.selectedDraft=event.target.value; render(); }
+    if (event.target.id==='draft-picker') { state.selectedDraft=event.target.value; state.documentAnchor=''; selectedDocument(); render(); $('draft-picker')?.focus({preventScroll:true}); }
+    if (event.target.id==='document-kind-picker') { selectDocument(event.target.value); $('document-kind-picker')?.focus({preventScroll:true}); }
 
   });
   doc.addEventListener('keydown',event=> {

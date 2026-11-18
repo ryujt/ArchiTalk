@@ -1,4 +1,4 @@
-use architalk::{document_format, domain, model::*};
+use architalk::{domain, model::*};
 use serde_json::json;
 
 const SAMPLE: &str = include_str!("fixtures/architecture.smart.md");
@@ -25,6 +25,7 @@ fn smartmd_document_survives_generation_trace_and_export_as_one_markdown() {
         input_revision: session.design_revision,
         hash: hash(&text),
         markdown: text.clone(),
+        documents: vec![],
         created_at: now(),
         content_status: "draft".into(),
         reviewed: false,
@@ -198,7 +199,7 @@ fn generation_and_critic_share_the_portable_contract_without_changing_conversati
     let session = domain::new_session("example".into(), "unknown".into(), vec![]);
     for kind in ["design", "critic"] {
         let prompt = domain::prompt(&session, kind, "ko").unwrap();
-        assert!(prompt.contains(document_format::RULES));
+        assert!(prompt.contains(architalk::design_package::RULES));
         assert!(prompt.contains("Keep unknown facts unknown") || kind == "critic");
         assert!(!prompt.contains("/Users/"));
     }
@@ -214,9 +215,9 @@ fn generation_and_critic_share_the_portable_contract_without_changing_conversati
     );
     assert_eq!(
         domain::effective_summary(&spec)["prompt_version"],
-        "architalk-v3-smartmd"
+        "architalk-v4-design-package"
     );
-    assert_eq!(domain::effective_summary(&spec)["schema_version"], 2);
+    assert_eq!(domain::effective_summary(&spec)["schema_version"], 3);
 }
 
 #[test]
@@ -229,6 +230,7 @@ fn historical_drafts_remain_exportable_without_format_migration() {
         input_revision: session.design_revision,
         hash: hash(markdown),
         markdown: markdown.into(),
+        documents: vec![],
         created_at: now(),
         content_status: "draft".into(),
         reviewed: true,
@@ -271,6 +273,7 @@ async fn invalid_design_fails_once_without_paid_repair_and_preserves_prior_draft
                 input_revision: session.design_revision,
                 hash: hash(prior),
                 markdown: prior.into(),
+                documents: vec![],
                 created_at: now(),
                 content_status: "draft".into(),
                 reviewed: true,

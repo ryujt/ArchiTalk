@@ -35,6 +35,7 @@ async function openSettings(page) {
   return (await response).json();
 }
 async function persistedFields(page) {
+  await expect(page.locator('#timeout-seconds')).toHaveValue('480');
   for(const [name,field,value,selection] of [
     ['claude','model','sonnet','sonnet'],['claude','effort','high','high'],
     ['codex','model','custom-codex-model',''],['codex','effort','provider-effort',''],
@@ -49,14 +50,29 @@ async function persistedFields(page) {
 
 test('known model choices and free input survive backend changes, save, reload and the next fixture runs',async({server,productPage},testInfo)=>{
   const {page,violations,errors}=productPage;
-  let diagnosticsRequests=0;
-  page.on('request',request=>{if(new URL(request.url()).pathname==='/api/v1/settings/diagnostics')diagnosticsRequests++;});
+  let diagnosticsRequests=0;const timeoutPatches=[];
+  page.on('request',request=>{
+    const path=new URL(request.url()).pathname;
+    if(path==='/api/v1/settings/diagnostics')diagnosticsRequests++;
+    if(path==='/api/v1/settings'&&request.method()==='PATCH')timeoutPatches.push(request.postDataJSON().payload.settings.ai.timeout_seconds);
+  });
   await page.goto(server.origin,{waitUntil:'domcontentloaded'});
   await expect(page.locator('#start-form')).toBeVisible();
   const initial=await server.workspace();
   const response=await openSettings(page);
   expect(response.choices).toEqual(choices);
   expect(response.diagnostics).toEqual([]);
+  const timeout=page.getByLabel('작업 시간 제한(초)',{exact:true});
+  await expect(timeout).toHaveValue(String(initial.settings.ai.timeout_seconds));
+  await expect(timeout).toHaveAttribute('min','10');await expect(timeout).toHaveAttribute('max','600');
+  await expect(timeout).toHaveAttribute('step','1');await expect(timeout).toHaveAttribute('required','');
+  for(const invalid of ['9','601','10.5','']){
+    await timeout.fill(invalid);expect(await timeout.evaluate(input=>input.validity.valid)).toBe(false);
+    await page.locator('#settings-form button[type="submit"]').click();
+    await expect(page.getByRole('dialog')).toBeVisible();expect(timeoutPatches).toEqual([]);
+  }
+  await timeout.fill('480');expect(await timeout.evaluate(input=>input.validity.valid)).toBe(true);
+
 
   // Both CLI defaults and every role expose the catalog before any diagnosis.
   for(const name of names){
@@ -111,6 +127,7 @@ test('known model choices and free input survive backend changes, save, reload a
   expect(saved.settings_revision).toBeGreaterThan(initial.settings_revision);
   expect(saved.runs).toEqual(initial.runs);
   expect(saved.settings.ai.default_backend).toBe('claude');
+  expect(saved.settings.ai.timeout_seconds).toBe(480);expect(timeoutPatches).toEqual([480]);
   expect(saved.settings.ai.backends.claude).toMatchObject({model:'sonnet',effort:'high'});
   expect(saved.settings.ai.backends.codex).toMatchObject({model:'custom-codex-model',effort:'provider-effort'});
   expect(saved.settings.ai.roles).toEqual({
@@ -139,9 +156,35 @@ test('known model choices and free input survive backend changes, save, reload a
   const completed=await server.workspace();
   for(const [kind,model,effort] of [['conversation','sonnet','high'],['design','fixture-custom-design','medium'],['critic','opus','max']]){
     const run=completed.runs.find(run=>run.kind===kind);
-    expect(run.effective_settings).toMatchObject({backend:'claude',model,effort});
+    expect(run.effective_settings).toMatchObject({backend:'claude',model,effort,timeout_seconds:480});
   }
   expect(completed.settings).toEqual(saved.settings);
+  const originalRuns=structuredClone(completed.runs);
+  await openSettings(page);await page.locator('#timeout-seconds').fill('240');
+  await page.locator('#settings-form button[type="submit"]').click();await expect(page.getByRole('dialog')).not.toBeVisible();
+  expect((await server.workspace()).runs).toEqual(originalRuns);
+  await server.configureSlowFixture(3);
+  await page.locator('[data-action="interview"]').click();
+  await page.locator('#answer-input').fill('SLOW_REQUEST: 시간 제한 변경 중인 합성 대화입니다.');
+  await page.locator('#answer-form button[type="submit"]').click();
+  await expect(page.locator('.pending-turn')).toBeVisible();
+  const inFlight=await server.workspace();expect(inFlight.active_run).not.toBeNull();
+  expect(inFlight.runs.at(-1).effective_settings.timeout_seconds).toBe(240);
+  await openSettings(page);await page.locator('#timeout-seconds').fill('120');
+  await page.locator('#settings-form button[type="submit"]').click();await expect(page.getByRole('dialog')).not.toBeVisible();
+  const changed=await server.workspace();expect(changed.settings.ai.timeout_seconds).toBe(120);
+  expect(changed.runs.slice(0,originalRuns.length)).toEqual(originalRuns);
+  expect(changed.runs.at(-1).effective_settings).toEqual(inFlight.runs.at(-1).effective_settings);
+  await expect.poll(async()=>{const w=await server.workspace();return w.active_run===null&&w.runs.at(-1).status==='completed';}).toBe(true);
+  await page.locator('#answer-input').fill('변경된 다음 작업의 제한을 확인하는 합성 대화입니다.');
+  await page.locator('#answer-form button[type="submit"]').click();
+  await expect.poll(async()=>{const w=await server.workspace();return w.active_run===null&&w.runs.length===originalRuns.length+2&&w.runs.at(-1).status==='completed';}).toBe(true);
+  const next=await server.workspace();expect(next.runs.at(-1).effective_settings.timeout_seconds).toBe(120);
+  expect(next.runs.slice(0,originalRuns.length)).toEqual(originalRuns);
+  expect(timeoutPatches).toEqual([480,240,120]);
+  await openSettings(page);await expect(page.locator('#timeout-seconds')).toHaveValue('120');
+  await capture(page,testInfo,'04-timeout-applied','top');await page.keyboard.press('Escape');
+
   expect(diagnosticsRequests).toBe(0);
   expect(violations).toEqual([]);expect(errors).toEqual([]);
 });

@@ -59,7 +59,7 @@ impl Default for AiConfig {
     fn default() -> Self {
         Self {
             default_backend: Backend::Claude,
-            timeout_seconds: 180,
+            timeout_seconds: 300,
             backends: Backends::default(),
             roles: Roles::default(),
         }

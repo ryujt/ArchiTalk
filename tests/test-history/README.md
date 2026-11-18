@@ -25,5 +25,10 @@
 | 앱 내 Markdown·SmartMD renderer | [document-renderer](document-renderer-20261118.md) | 실제 renderer·정화·소스 검토 통과 |
 | 앱 렌더링·도표·적대적 문서 브라우저 | [document-rendering-browser](document-rendering-browser-20261118.md) | 원문 표시 재현·수정, 최종 12건 통과 |
 | renderer HTTP·자산·앱 조립 | [document-rendering-integration](document-rendering-integration-20261118.md) | Node 21·Rust 80·clippy·브라우저 통과 |
+| Method-R 패키지 생성·품질·추적성 계약 | [design-package-domain](design-package-domain-20261118.md) | 도메인 44건 통과, HTML 위장·모듈 링크 범위 반례 수정 |
+| 10파일 발행·WAL 백업·schema2 호환 | [design-package-storage](design-package-storage-20261118.md) | 집중 37건·실제 구버전 binary 거절 1건 통과 |
+| 문서 종류 선택·패키지 링크·anchor | [design-package-ui](design-package-ui-20261118.md) | 기존·신규 Node 28건 통과, 시간 제한 설정 포함 |
+| 10종 문서·anchor·전체 파일 저장 브라우저 | [design-package-browser](design-package-browser-20261118.md) | desktop/mobile 전체 14건·실제 원문/시간 제한 추가 4건 통과, 실패 이력 보존 |
+| 종류별 설계·전체 검토·저장 최종 조립 | [design-package-integration](design-package-integration-20261118.md) | Rust 108·Node 28·브라우저 전체14+추가4 통과, 실제 응답·전역0.2.0 확인 |
 
 최초 작업으로 참고할 이전 실행은 없었다. 후속 실행은 각 기록의 미검증·후속 조건을 먼저 확인한다.
