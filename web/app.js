@@ -231,6 +231,9 @@ export function startWorkspace(doc = document, win = window) {
   const canApprove = () => !approvalIssues().length && !runIsActive(state.run) && !unknownTermination(state.run);
   const globalRun = () => state.workspace?.active_run;
   const disabled = () => state.connectionBlocked || state.busy || runIsActive(state.run) || unknownTermination(state.run) || runIsActive(globalRun()) || unknownTermination(globalRun());
+  const canRetryConversation = () => Boolean(state.session && state.run?.kind === 'conversation'
+    && ['failed','cancelled','interrupted'].includes(state.run.status)
+    && ['confirmed','manually_confirmed'].includes(state.run.process_termination));
   const envelope = (payload, revision = state.session?.revision) => ({command_id: win.crypto.randomUUID(), expected_revision: revision, payload});
   const sessionPath = suffix => `${API_ROOT}sessions/${idPath(state.session.id)}${suffix}`;
 
@@ -653,7 +656,8 @@ export function startWorkspace(doc = document, win = window) {
 
   function recovery() {
     const run = state.run, last = list(state.session?.messages).at(-1), lastExport = state.lastExport;
-    return `<section class="status-card"><div class="status-icon ${unknownTermination(run)?'warn':''}" aria-hidden="true">↶</div><h1>남겨 둔 설계에서 이어가세요</h1><p>서버에 확인된 대화와 초안을 불러왔어요. 중단된 작업을 자동으로 다시 요청하지 않아요.</p><div class="recovery-details"><div><span>대화 주제</span><strong>${esc(state.session?.title)}</strong></div><div><span>마지막 대화</span><strong>${esc(formatTime(last?.created_at)||'기록 없음')}</strong></div><div><span>문서 상태</span><strong>${draft()?`초안 ${list(state.session.drafts).length}개 · ${draftIsCurrent(state.session,draft())?'현재':'이전'} 대화 기준`:'아직 생성하지 않음'}</strong></div>${run?`<div><span>최근 작업</span><strong>${esc(describeStatus(run))}</strong></div>`:''}${lastExport?`<div><span>최근 문서 반영</span><strong>${lastExport.status==='completed'?'저장 완료':lastExport.status==='preview'?'미리보기만 확인':lastExport.status==='conflict'?'충돌 · 새 사본 확인 필요':'저장 결과 확인 필요'}</strong></div>`:''}</div>${lastExport?.result?.paths?.length?`<div class="saved-path">${lastExport.result.paths.map(path=>`<strong>${esc(path)}</strong>`).join('')}</div>`:''}${unknownTermination(run)?`<div class="warning-box">이전 로컬 도구의 종료가 확인되지 않았어요. 실행한 터미널에서 해당 작업을 정리한 뒤 종료를 확인해 주세요. 확인 전에는 새 AI 작업을 시작할 수 없어요.</div><label class="confirm-row"><input type="checkbox" id="termination-confirm">이전 작업의 로컬 도구를 직접 종료했어요.</label><div class="button-row">${button('confirm-termination','수동 종료 확인','secondary',state.busy)}</div>`:''}<div class="button-row">${button('interview','이어서 대화하기','primary',state.busy)}${draft()?button('review','초안 먼저 살펴보기','secondary',state.busy):''}${button('new-session','새 대화 시작','quiet-button',state.busy)}</div></section>`;
+    const retry = canRetryConversation();
+    return `<section class="status-card"><div class="status-icon ${unknownTermination(run)?'warn':''}" aria-hidden="true">↶</div><h1>남겨 둔 설계에서 이어가세요</h1><p>서버에 확인된 대화와 초안을 불러왔어요. 중단된 작업을 자동으로 다시 요청하지 않아요.</p><div class="recovery-details"><div><span>대화 주제</span><strong>${esc(state.session?.title)}</strong></div><div><span>마지막 대화</span><strong>${esc(formatTime(last?.created_at)||'기록 없음')}</strong></div><div><span>문서 상태</span><strong>${draft()?`초안 ${list(state.session.drafts).length}개 · ${draftIsCurrent(state.session,draft())?'현재':'이전'} 대화 기준`:'아직 생성하지 않음'}</strong></div>${run?`<div><span>최근 작업</span><strong>${esc(describeStatus(run))}</strong></div>`:''}${lastExport?`<div><span>최근 문서 반영</span><strong>${lastExport.status==='completed'?'저장 완료':lastExport.status==='preview'?'미리보기만 확인':lastExport.status==='conflict'?'충돌 · 새 사본 확인 필요':'저장 결과 확인 필요'}</strong></div>`:''}</div>${lastExport?.result?.paths?.length?`<div class="saved-path">${lastExport.result.paths.map(path=>`<strong>${esc(path)}</strong>`).join('')}</div>`:''}${unknownTermination(run)?`<div class="warning-box">이전 로컬 도구의 종료가 확인되지 않았어요. 실행한 터미널에서 해당 작업을 정리한 뒤 종료를 확인해 주세요. 확인 전에는 새 AI 작업을 시작할 수 없어요.</div><label class="confirm-row"><input type="checkbox" id="termination-confirm">이전 작업의 로컬 도구를 직접 종료했어요.</label><div class="button-row">${button('confirm-termination','수동 종료 확인','secondary',state.busy)}</div>`:''}<div class="button-row">${retry?button('retry-conversation','답변 다시 받기','primary',disabled()):''}${button('interview','이어서 대화하기',retry?'secondary':'primary',state.busy)}${draft()?button('review','초안 먼저 살펴보기','secondary',state.busy):''}${button('new-session','새 대화 시작','quiet-button',state.busy)}</div></section>`;
   }
 
   function diagnosticStage() {
@@ -664,7 +668,8 @@ export function startWorkspace(doc = document, win = window) {
 
   function errorStage() {
     const cancelled = state.scene === 'paused';
-    return `<section class="status-card"><div class="status-icon ${cancelled?'warn':'error'}" aria-hidden="true">${cancelled?'Ⅱ':'!'}</div><h1>${cancelled?'작업 중지를 확인했어요':'작업을 완료하지 못했어요'}</h1><p>${cancelled?'서버가 로컬 도구의 종료를 확인했어요.':'마지막으로 확인된 대화와 완성된 초안에서 이어갈 수 있어요.'}</p>${state.run?.error?`<div class="error-detail">${esc(typeof state.run.error==='string'?state.run.error:state.run.error.message || state.run.error.code)}</div>`:''}<div class="button-row">${button('interview','대화로 돌아가기','primary')}${draft()?button('review','완성된 초안 보기'):''}${button('generate','현재 답변으로 다시 정리','secondary',disabled())}${button('settings','도구 설정 확인','quiet-button')}</div><p class="progress-foot">다시 정리하기는 새 AI 작업을 시작해요. 이전 응답을 자동으로 재실행하지 않아요.</p></section>`;
+    const retry = canRetryConversation();
+    return `<section class="status-card"><div class="status-icon ${cancelled?'warn':'error'}" aria-hidden="true">${cancelled?'Ⅱ':'!'}</div><h1>${cancelled?'작업 중지를 확인했어요':'작업을 완료하지 못했어요'}</h1><p>${cancelled?'서버가 로컬 도구의 종료를 확인했어요.':'마지막으로 확인된 대화와 완성된 초안에서 이어갈 수 있어요.'}</p>${state.run?.error?`<div class="error-detail">${esc(typeof state.run.error==='string'?state.run.error:state.run.error.message || state.run.error.code)}</div>`:''}<div class="button-row">${retry?button('retry-conversation','답변 다시 받기','primary',disabled()):''}${button('interview','대화로 돌아가기',retry?'secondary':'primary')}${draft()?button('review','완성된 초안 보기'):''}${button('generate','현재 답변으로 다시 정리','secondary',disabled())}${button('settings','도구 설정 확인','quiet-button')}</div><p class="progress-foot">${retry?'답변 다시 받기는 마지막 사용자 입력으로 새 AI 작업을 시작해요. 대화에 같은 입력을 추가하지 않아요.':'다시 정리하기는 새 AI 작업을 시작해요. 이전 응답을 자동으로 재실행하지 않아요.'}</p></section>`;
   }
 
   function saved() {
@@ -864,6 +869,14 @@ export function startWorkspace(doc = document, win = window) {
     }
     if (action==='diagnostic-status') { state.scene='diagnostic'; render(); return; }
     if (action==='refresh') { void command(()=>refresh({initial:!state.workspace,keep:false})); return; }
+    if (action==='retry-conversation') {
+      if (!canRetryConversation() || disabled()) return;
+      void command(async()=> {
+        adoptResult(await api(sessionPath('/conversation/retry'),{method:'POST',body:envelope({})}));
+        announce('같은 사용자 입력으로 답변을 다시 받고 있어요.');
+      });
+      return;
+    }
     if (action==='generate') { void command(async()=> {
       const result=await api(sessionPath('/draft'),{method:'POST',body:envelope({})}); adoptResult(result); announce('설계 정리를 시작했어요.');
     }); return; }

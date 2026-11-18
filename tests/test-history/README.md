@@ -34,5 +34,9 @@
 | 삭제·교체 감지·SSE·프로세스 취소·락 소유 종료 | [project-state-reset](project-state-reset-20261118.md) | 삭제 반례·fork 상속 재현 후 집중47 통과 |
 | CLI 버전·project runtime·Codex home/auth 읽기 | [project-state-ai](project-state-ai-20261118.md) | 327 명시 지원, private-home 대조·원인 수정·제한/진단 검증 |
 | 이전 화면 제거·새 연결·same-origin 재시작 | [project-state-ui](project-state-ui-20261118.md) | 최초 반례4실패 보존, Node27·browser16+후속2 통과 |
+| 대화 prompt·UTF-8/선택지 제한·정확한 오류 | [question-contract](question-contract-20261118.md) | 최초 반례2실패 보존, domain/design-package37 통과 |
+| 응답 보정·실패 원자성·재시도 UI/브라우저 | [question-workflow](question-workflow-20261118.md) | subprocess3·Node29·browser4 통과, 초기 fixture/도구 실패 보존 |
+| 원문 보존·명시적 대화 retry API | [conversation-retry](conversation-retry-20261118.md) | 최초 반례 보존, 집중23·clippy·fmt 통과 |
+| 질문 오류·favicon·최종 조립·설치 | [question-integration](question-integration-20261118.md) | Rust141·Node35·browser4·실제 Claude 첫 대화·전역0.2.2 통과 |
 
 최초 작업으로 참고할 이전 실행은 없었다. 후속 실행은 각 기록의 미검증·후속 조건을 먼저 확인한다.

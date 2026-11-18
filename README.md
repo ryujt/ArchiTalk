@@ -49,6 +49,8 @@ architalk
 
 응답을 기다리는 동안 대화 화면에 작성 중 메시지가 표시됩니다. 답변이 완료되면 최신 대화와 입력창이 보이도록 이동하며, 넓은 화면에서는 대화도 작업 영역의 너비에 맞춰 확장됩니다.
 
+대화 작업이 실패하거나 중단됐다면 **답변 다시 받기**로 마지막 사용자 입력에 대한 답변을 다시 요청할 수 있습니다. 기존 메시지를 중복 추가하지 않으며, 현재 도구 설정으로 새 작업을 시작합니다. 업데이트 후에는 실행 중인 서버를 Ctrl+C로 종료하고 `architalk`를 다시 실행해 새로 열린 주소에 접속하세요. 저장된 대화를 선택하면 복구 화면에서 이어갈 수 있습니다.
+
 ```bash
 architalk --no-open                  # URL만 출력
 architalk --project /path/to/project # 실행 폴더를 명시
@@ -85,7 +87,7 @@ architalk --config /path/to/config.toml
 
 프로젝트 자료는 선택한 README·구성 파일의 제한된 텍스트만 전달합니다. 숨김/인증 파일·symlink·바이너리는 제외합니다. 질문에는 모름·추천·보류로 답할 수 있고, 확인되지 않은 값은 확정 사실로 처리하지 않습니다. 생성된 해석·요구는 근거와 함께 검토하세요.
 
-프로세스가 중단되면 마지막 확정 상태를 복원합니다. 이전 AI 프로세스의 종료가 불명확하면 새 실행을 막고 직접 정리한 뒤 확인하도록 안내합니다. 중단된 모델 작업은 자동 재실행하지 않습니다. 대화·비판 검토의 응답 형식이 잘못되면 한 번의 보정 호출이 추가될 수 있습니다. 설계 패키지의 형식 오류는 자동 재호출하지 않고 실패를 보여줍니다. 문서 저장은 파일 hash와 manifest로 복구하며, 예상 밖 외부 편집은 충돌로 남깁니다.
+프로세스가 중단되면 마지막 확정 상태를 복원합니다. 이전 AI 프로세스의 종료가 불명확하면 새 실행을 막고 직접 정리한 뒤 확인하도록 안내합니다. 중단된 모델 작업은 자동 재실행하지 않습니다. 대화·비판 검토의 응답 형식이 잘못되면 한 번의 보정 호출이 추가될 수 있습니다. 질문의 선택지 수·UTF-8 길이 등 응답 제한을 모델에도 전달하며, 초과하면 항목과 실제 크기·한도를 표시합니다. 실패한 응답은 대화 내용에 반영하지 않고, 종료가 확인된 대화는 **답변 다시 받기**로 명시적으로 재시도할 수 있습니다. 설계 패키지의 형식 오류는 자동 재호출하지 않고 실패를 보여줍니다. 문서 저장은 파일 hash와 manifest로 복구하며, 예상 밖 외부 편집은 충돌로 남깁니다.
 
 ## 개발과 검증
 
@@ -115,6 +117,7 @@ cargo test --test ai_adapter real_ -- --ignored --nocapture --test-threads=1
 cargo test --test real_workflow -- --ignored --nocapture --test-threads=1
 cargo test --test real_document_format -- --ignored --nocapture # Codex 설계 1회
 cargo test --test real_project_isolation -- --ignored --nocapture # Claude/Codex 짧은 요청 각 1회
+cargo test --test real_conversation -- --ignored --nocapture # Claude 실제 첫 대화 계약 1건
 ```
 
 두 번째 명령은 실제 바이너리→로컬 HTTP/SSE→CLI 대화·설계·검토→문서 저장→재시작을 임시 프로젝트에서 확인합니다. [검증 실행 이력](tests/test-history/README.md)에서 성공·실패·미실행 범위를 구분합니다.

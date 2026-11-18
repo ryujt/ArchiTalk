@@ -506,3 +506,50 @@ test('a new capability fragment reboots the same-origin connection but ordinary 
     assert.doesNotMatch(h.doc.getElementById('workspace-content').innerHTML,/실제 CLI에서 확정된 질문/);
   }finally{h.dispose();}
 });
+
+test('failed conversation offers explicit retry in recovery and error without duplicating user input',async()=>{
+  let session=sessionFixture(),run={id:'failed-conversation',session_id:session.id,kind:'conversation',status:'failed',process_termination:'confirmed',error:{code:'invalid_model_output',message:'questions[0].options: observed 5 items; limit 4 items'}};
+  const original=structuredClone(session.messages);let release;
+  const workspace=()=>({project_name:'retry project',sessions:[session],runs:[run],active_run:run.status==='running'?run:null,exports:[],context_files:[]});
+  const h=harness(async(path,options,body)=>{
+    if(path==='/api/v1/workspace')return workspace();
+    if(path.endsWith('/conversation/retry')){
+      assert.equal(options.method,'POST');assert.equal(body.expected_revision,4);assert.deepEqual(body.payload,{});assert.match(body.command_id,/^[\da-f-]{36}$/);
+      return new Promise(resolve=>{release=()=>{run={...run,id:'retry-run',status:'running',process_termination:'pending',error:null};session={...session,revision:5,active_run_id:run.id};resolve({session,run});};});
+    }
+    return path.includes('/runs/')?run:session;
+  });
+  try{
+    await eventually(()=>h.app.state.scene==='recovery');
+    assert.match(h.doc.getElementById('workspace-content').innerHTML,/class="primary" data-action="retry-conversation"[^>]*>답변 다시 받기/);
+    await h.app.refresh({keep:false});assert.equal(h.app.state.scene,'error');
+    assert.match(h.doc.getElementById('workspace-content').innerHTML,/class="primary" data-action="retry-conversation"[^>]*>답변 다시 받기/);
+    assert.match(h.doc.getElementById('workspace-content').innerHTML,/대화로 돌아가기/);
+    assert.match(h.doc.getElementById('workspace-content').innerHTML,/현재 답변으로 다시 정리/);
+    h.app.state.answer='아직 보내지 않은 입력';h.click('retry-conversation');h.click('retry-conversation');
+    await eventually(()=>release);assert.equal(h.requests.filter(r=>r.path.endsWith('/conversation/retry')).length,1);
+    release();await eventually(()=>h.app.state.scene==='generating'&&!h.app.state.busy);
+    assert.deepEqual(h.app.state.session.messages,original);assert.equal(h.app.state.answer,'아직 보내지 않은 입력');
+    assert.match(h.doc.getElementById('workspace-content').innerHTML,/pending-turn/);
+    assert.match(h.doc.getElementById('workspace-content').innerHTML,/실제 CLI에서 확정된 질문/);
+    assert.equal(h.requests.filter(r=>r.path.endsWith('/messages')||r.path.endsWith('/draft')).length,0);
+  }finally{h.dispose();}
+});
+
+test('conversation retry respects latest kind, status, and confirmed termination gate',async()=>{
+  for(const [kind,status,termination,eligible] of [
+    ['conversation','failed','confirmed',true],['conversation','cancelled','confirmed',true],['conversation','interrupted','manually_confirmed',true],
+    ['conversation','completed','confirmed',false],['design','failed','confirmed',false],['critic','failed','confirmed',false],
+    ['conversation','interrupted','unknown',false],['conversation','failed','pending',false]
+  ]){
+    const session=sessionFixture(),run={id:'latest-run',session_id:session.id,kind,status,process_termination:termination};
+    const h=harness(async path=>path==='/api/v1/workspace'?{project_name:'gate',sessions:[session],runs:[run],active_run:termination==='unknown'?run:null,exports:[],context_files:[]}:path.includes('/runs/')?run:session);
+    try{
+      await eventually(()=>h.app.state.scene==='recovery');
+      const html=h.doc.getElementById('workspace-content').innerHTML;
+      assert.equal(html.includes('data-action="retry-conversation"'),eligible,`${kind}/${status}/${termination}`);
+      if(termination==='unknown')assert.match(html,/수동 종료 확인/);
+      if(!eligible){h.click('retry-conversation');assert.equal(h.requests.filter(r=>r.options.method==='POST').length,0);}
+    }finally{h.dispose();}
+  }
+});

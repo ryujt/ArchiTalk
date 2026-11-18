@@ -6,6 +6,8 @@
 
 Rust 바이너리에 `web/` 정적 자산을 포함한다. 시작 시 cwd 또는 `--project`를 고정하고 root inode와 상태 파일을 잠근 뒤 loopback listener를 연다. API는 프로세스 토큰·정확한 Host/Origin으로 보호한다. 브라우저는 URL fragment 토큰을 제거하고 같은 origin의 fetch HTTP/SSE를 사용한다.
 
+페이지 아이콘도 바이너리에 포함하고 `/favicon.ico`에서 제공한다. 정적 자산에는 API 토큰이 필요 없지만 동일한 Host/Origin 검사와 보안 헤더를 적용한다.
+
 `App`은 하나의 논리 writer이며, 짧은 SQLite transaction에 workspace snapshot·receipt·event를 함께 저장한다. AI를 기다리는 동안 DB lock을 유지하지 않는다. 모델 프로세스와 help 진단은 같은 프로젝트 실행 slot을 선예약한다. 생성 중 설정 변경은 다음 run에 적용한다. 제품 main은 공통 설정 파일을 App에 연결하고 AI 설정을 매 작업 전에 다시 읽는다. 웹 저장은 파일 lock·내용 hash 비교·atomic rename으로 AI 일반 설정만 갱신한다. 문서 경로·대화·run은 프로젝트 DB에 남는다. 테스트의 `App::open`은 공통 파일을 건드리지 않는 격리 모드다.
 
 AI 작업의 기본 시간 제한은 300초이며 웹/TOML 설정의 `ai.timeout_seconds`로 10..600초를 지정한다. 기존 프로젝트에 명시적으로 저장한 값은 유지하고, 대화·설계·검토 각각의 run 시작 시 설정을 고정한다.
@@ -28,6 +30,7 @@ DB schema는 2다. v1에서 이행하기 전에 SQLite online backup으로 WAL�
 | `POST /sessions` | `title`, `intro`, `context_paths`로 생성하고 대화 run 접수 |
 | `GET /sessions/{id}` | 세션과 현재 초안의 readiness 문제·cursor |
 | `POST /sessions/{id}/messages` | `content` 저장과 대화 run |
+| `POST /sessions/{id}/conversation/retry` | 빈 payload로 최근 실패·취소·중단된 대화 재요청. 종료 확인·idle·revision 조건을 검사하고 `{session, run}` 반환 |
 | `GET/POST /sessions/{id}/draft` | 완성 초안 조회 / 작성 run 접수 후 독립 비판 검토 |
 | `POST /sessions/{id}/critic` | 마지막 완성 초안의 명시적 재검토 |
 | `POST /sessions/{id}/review` | 승인·지적 처리·진술 확인·범위 보류 |
@@ -46,6 +49,8 @@ DB schema는 2다. v1에서 이행하기 전에 SQLite online backup으로 WAL�
 ## 대화·검토·저장
 
 - 작성 중에는 대화/검토 화면 안의 임시 메시지와 중지 버튼을 표시한다. 임시 CLI JSON은 답변으로 표시하지 않는다. 대화가 완료되면 최신 메시지와 입력창을 보여주며 일반 snapshot과 모달 갱신에서는 읽기 위치를 보존한다.
+- 대화 후보의 배열 수·문자열 UTF-8 byte·NUL·총량 제한은 검증과 prompt가 같은 상수를 사용한다. 오류는 원문 대신 field/index·실제 크기·한도를 전달한다. 기존 최대 한 번의 형식 보정을 유지하며 실패 후보는 원자적으로 거절한다.
+- 실패·중단 화면과 재접속 복구 화면의 **답변 다시 받기**는 종료가 확인된 최근 conversation에만 제공한다. 새 메시지를 추가하지 않고 기존 대화·초안·의미 입력 버전과 실패 이력을 보존하며 현재 공통 AI 설정으로 새 run을 만든다. 완료·활성·종료 미확인 run 및 design/critic 실패에는 이 작업을 허용하지 않는다.
 - 질문이 남아 있어도 이야기 나누기의 다음 단계 버튼으로 초안을 만들 수 있다. 새 설계 응답은 [10종 패키지 계약](../prompts/design-package-format.md)을 사용한다. `markdown`은 Method-R 주 문서이고, `documents`는 정확히 9종의 `{kind, markdown}` 항목이다. 모델이 파일명이나 경로를 정할 수 없다. SmartMD·종류별 필수 절·전용 DSL·DRV/QA/ALT/ADR/VAL 연결과 실제 문서 anchor를 검사한다. 형식 오류는 실패로 기록하고 모델을 자동 재호출하지 않는다. 기존 저장 문서는 다시 검사하거나 변환하지 않는다.
 - 비판 검토에는 주 문서와 상세 문서 전체를 전달한다. 문맥 제한을 넘으면 일부를 잘라 검토하지 않고 명시적으로 실패시킨다. 이미 완성한 설계는 보존하고 검토 실패를 구분한다. 자료가 부족하면 가정·미정·조건부 대안을 남기도록 하며, 정량 목표나 사용자의 승인을 만들어 내지 않도록 지시한다. 구조 검사는 설계 내용의 정확성 보장이 아니다.
 - 검토 UI의 문서 종류 선택은 서버 카탈로그와 실제 초안을 조합한다. 카탈로그에 있는 파일 링크만 종류 전환과 로컬 anchor 이동으로 처리한다. 제목 ID는 원문 HTML ID를 신뢰하지 않고 정화 후 생성한다. Markdown·SmartMD·Mermaid와 4종 DSL은 내장 자산으로 표시하고, 원문 보기와 도표별 오류를 제공한다. 문서와 생성 SVG는 따로 정화한다.

@@ -51,6 +51,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/sessions", post(create))
         .route("/sessions/{id}", get(session))
         .route("/sessions/{id}/messages", post(message))
+        .route(
+            "/sessions/{id}/conversation/retry",
+            post(retry_conversation),
+        )
         .route("/sessions/{id}/draft", get(draft).post(generate_draft))
         .route("/sessions/{id}/review", post(review))
         .route("/sessions/{id}/critic", post(critic))
@@ -66,6 +70,7 @@ pub fn router(state: ServerState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .route("/", get(index))
+        .route("/favicon.ico", get(favicon))
         .route("/app.js", get(script))
         .route("/style.css", get(style))
         .route("/document-renderer.js", get(document_renderer))
@@ -82,6 +87,12 @@ pub fn router(state: ServerState) -> Router {
 }
 async fn index() -> Html<&'static str> {
     Html(include_str!("../web/index.html"))
+}
+async fn favicon() -> impl IntoResponse {
+    (
+        [("content-type", "image/x-icon")],
+        include_bytes!("../web/favicon.ico").as_slice(),
+    )
 }
 async fn script() -> impl IntoResponse {
     (
@@ -298,6 +309,11 @@ macro_rules! mutation {
     };
 }
 mutation!(message, "message", StatusCode::ACCEPTED);
+mutation!(
+    retry_conversation,
+    "retry_conversation",
+    StatusCode::ACCEPTED
+);
 mutation!(generate_draft, "draft", StatusCode::ACCEPTED);
 mutation!(critic, "critic", StatusCode::ACCEPTED);
 mutation!(review, "review", StatusCode::OK);

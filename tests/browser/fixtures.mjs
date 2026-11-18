@@ -1,5 +1,5 @@
 import {test as base,expect} from '@playwright/test';
-import {mkdtemp,mkdir,copyFile,chmod,writeFile,rm,readFile} from 'node:fs/promises';
+import {mkdtemp,mkdir,copyFile,chmod,writeFile,rm,readFile,rename} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {spawn} from 'node:child_process';
@@ -48,8 +48,39 @@ async function startServer() {
     if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');
     await closed;await rm(temporary,{recursive:true,force:true});throw error;
   }
+  const conversationControl=join(tools,'question-overflow.json');
+  let conversationControlled=false;
+  const writeConversationControl=async value=>{
+    await writeFile(`${conversationControl}.tmp`,JSON.stringify(value));
+    await rename(`${conversationControl}.tmp`,conversationControl);
+  };
   return {
     ...endpoint,project,
+    async configureConversationOverflow(enabled,{hold=false}={}){
+      if(typeof enabled!=='boolean'||typeof hold!=='boolean')throw new Error('Conversation fixture controls must be booleans.');
+      if(!conversationControlled){
+        const source=await readFile(executable,'utf8');
+        const promptMarker='prompt=sys.stdin.read()\n';
+        const resultMarker='text=json.dumps(result,ensure_ascii=False)\n';
+        const contextMarker="context=json.loads(prompt.split('CONTEXT_JSON:\\n',1)[1])";
+        if(!source.includes(promptMarker)||!source.includes(resultMarker)||!source.includes(contextMarker))throw new Error('Conversation fixture shape changed.');
+        // The parent owns this control file. The restricted child only reads it;
+        // it never writes a global counter, project state, or shared AI history.
+        const waitControl=`${promptMarker}fixture_task=prompt.split('TASK:\\n',1)[1].split('\\n',1)[0]\nfixture_control={}\nif fixture_task.startswith('Help the user design'):\n control=Path(__file__).with_name('question-overflow.json')\n deadline=time.monotonic()+15\n while True:\n  fixture_control=json.loads(control.read_text(encoding='utf-8'))\n  if not fixture_control['hold']:break\n  if time.monotonic()>deadline:raise RuntimeError('test parent did not release its conversation fixture')\n  time.sleep(0.02)\n`;
+        const overflow=`if fixture_task.startswith('Help the user design') and fixture_control.get('enabled'):\n result['questions'][0]['options']=['합성 선택지1','합성 선택지2','합성 선택지3','합성 선택지4','합성 선택지5']\n${resultMarker}`;
+        // A repair suffix follows the original CONTEXT_JSON. Decode its first
+        // object so this stand-in can produce a second invalid/valid response.
+        const repairedContext="context=json.JSONDecoder().raw_decode(prompt.split('CONTEXT_JSON:\\n',1)[1])[0]";
+        await writeFile(executable,source.replace(promptMarker,waitControl).replace(contextMarker,repairedContext).replace(resultMarker,overflow));
+        conversationControlled=true;
+      }
+      await writeConversationControl({enabled,hold});
+    },
+    async releaseConversationFixture(){
+      if(!conversationControlled)throw new Error('Conversation control is not configured.');
+      const value=JSON.parse(await readFile(conversationControl,'utf8'));
+      await writeConversationControl({...value,hold:false});
+    },
     async configureDocumentFixture(markdown){
       if(typeof markdown!=='string'||Buffer.byteLength(markdown)>500_000)throw new Error('Invalid isolated document fixture.');
       const packagePath=join(tools,'design-package.json');

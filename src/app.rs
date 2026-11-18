@@ -592,6 +592,33 @@ impl App {
                     serde_json::to_value(&next.sessions[pos])?,
                 )?;
                 match operation {
+                    "retry_conversation" => {
+                        check_idle(&next)?;
+                        let latest = next.runs.iter().rev().find(|run| run.session_id == sid);
+                        if !latest.is_some_and(|run| {
+                            run.kind == "conversation"
+                                && ["failed", "cancelled", "interrupted"]
+                                    .contains(&run.status.as_str())
+                                && ["confirmed", "manually_confirmed"]
+                                    .contains(&run.process_termination.as_str())
+                        }) {
+                            return Err(AppError::new(
+                                "retry_not_allowed",
+                                "종료가 확인된 최근 대화 작업이 실패하거나 중단된 경우에만 다시 요청할 수 있습니다.",
+                            ));
+                        }
+                        let s = &mut next.sessions[pos];
+                        let l = prepare_run(
+                            s,
+                            &mut next.runs,
+                            &next.settings,
+                            "conversation",
+                            &self.root,
+                        )?;
+                        let response = json!({"session":s,"run":next.runs.last()});
+                        launch = Some(l);
+                        response
+                    }
                     "message" | "draft" | "critic" => {
                         check_idle(&next)?;
                         let s = &mut next.sessions[pos];

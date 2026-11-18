@@ -332,3 +332,190 @@ fn readiness_requires_an_active_sourced_requirement_and_rechecks_exact_quotes() 
     s.requirements[0].status = "superseded".into();
     assert!(!domain::readiness(&s, &draft).is_empty());
 }
+
+#[test]
+fn conversation_limit_contract_prompt_names_every_bound_in_utf8_bytes() {
+    let s = domain::new_session("도구".into(), "작은 도구입니다.".into(), vec![]);
+    let prompt = domain::prompt(&s, "conversation", "ko").unwrap();
+    let encoded = prompt
+        .split("CONVERSATION_LIMITS_JSON:\n")
+        .nth(1)
+        .expect("conversation prompt must disclose the validator's numeric contract")
+        .lines()
+        .next()
+        .unwrap();
+    let limits: Value = serde_json::from_str(encoded).unwrap();
+    assert_eq!(limits["units"], "UTF-8 bytes, not characters");
+    assert_eq!(limits["no_nul"], true);
+    for (path, maximum) in [
+        ("claims", 40),
+        ("requirements", 40),
+        ("decisions", 20),
+        ("coverage_updates", 30),
+        ("questions", 20),
+        ("questions[].options", 4),
+        ("decisions[].alternatives", 5),
+        ("evidence_refs", 40),
+        ("requirement_refs", 40),
+    ] {
+        assert_eq!(limits["max_items"][path], maximum, "{path}");
+    }
+    for (path, maximum) in [
+        ("reply", 8192),
+        ("claims[].kind", 32),
+        ("claims[].id", 200),
+        ("requirements[].supersedes", 200),
+        ("coverage_updates[].id", 200),
+        ("questions[].target_ref", 200),
+        ("questions[].text", 2000),
+        ("questions[].reason", 8192),
+        ("questions[].options[]", 1000),
+        ("evidence_refs[]", 200),
+        ("requirement_refs[]", 200),
+        ("decisions[].alternatives[]", 8192),
+    ] {
+        assert_eq!(limits["max_bytes"][path], maximum, "{path}");
+    }
+    assert_eq!(limits["aggregate_text_max_bytes"], 262144);
+    assert!(prompt.contains("normally return one candidate"));
+}
+
+#[test]
+fn conversation_limit_contract_question_errors_identify_the_exact_bound_without_source_text() {
+    let mut s = domain::new_session("도구".into(), "작은 도구입니다.".into(), vec![]);
+    let before = serde_json::to_value(&s).unwrap();
+    let mut errors = Vec::new();
+    for question in [
+        json!({"target_ref":"scope","text":"어떤 범위인가요?","reason":"범위를 확인합니다.","options":["A","B","C","D","E"]}),
+        json!({"target_ref":"scope","text":"어떤 범위인가요?","reason":"범위를 확인합니다.","options":["가".repeat(334)]}),
+        json!({"target_ref":"scope","text":"가".repeat(667),"reason":"범위를 확인합니다."}),
+        json!({"target_ref":"scope","text":"어떤 범위인가요?","reason":"비밀\0본문"}),
+    ] {
+        let error = domain::apply_conversation(
+            &mut s,
+            candidate(json!({"reply":"현재 목적을 이해했습니다.","questions":[question]})),
+        )
+        .unwrap_err();
+        errors.push(error.to_string());
+        assert_eq!(
+            serde_json::to_value(&s).unwrap(),
+            before,
+            "rejection must leave the complete session unchanged"
+        );
+    }
+    assert_eq!(
+        errors,
+        vec![
+            "questions[0].options: observed 5 items; limit 4 items",
+            "questions[0].options[0]: observed 1002 UTF-8 bytes; limit 1000 UTF-8 bytes",
+            "questions[0].text: observed 2001 UTF-8 bytes; limit 2000 UTF-8 bytes",
+            "questions[0].reason: observed 1 NUL bytes; limit 0 NUL bytes",
+        ]
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|error| !error.contains("비밀") && !error.contains("본문"))
+    );
+}
+
+#[test]
+fn conversation_limit_contract_exact_utf8_option_boundary_is_preserved() {
+    let mut s = domain::new_session("도구".into(), "작은 도구입니다.".into(), vec![]);
+    let options = vec![
+        format!("{}a", "가".repeat(333)),
+        "둘째".into(),
+        "셋째".into(),
+        "미정".into(),
+    ];
+    assert_eq!(options[0].len(), 1000);
+    apply(
+        &mut s,
+        json!({"reply":"현재 목적을 이해했습니다.","questions":[{"target_ref":"scope","text":"어떤 범위인가요?","reason":"범위를 확인합니다.","options":options}]}),
+    );
+    assert!(
+        s.questions
+            .iter()
+            .any(|question| question.target_ref == "scope" && question.options == options)
+    );
+}
+
+#[test]
+fn conversation_limit_contract_other_fields_keep_caps_and_report_safe_paths() {
+    let mut s = domain::new_session("도구".into(), "작은 도구입니다.".into(), vec![]);
+    let before = serde_json::to_value(&s).unwrap();
+    let claim = json!({"text":"해석","kind":"interpretation","evidence_refs":["source"],"source_quote":"도구"});
+    let requirement = json!({"text":"요구","acceptance":"동작 확인","evidence_refs":["source"],"source_quote":"도구"});
+    let decision = json!({"title":"선택","alternatives":["A","B"],"rationale":"이유","consequences":"결과","evidence_refs":["source"],"source_quote":"도구"});
+    let mut cases = vec![
+        (json!({"reply":"x".repeat(8193)}), "reply"),
+        (
+            json!({"reply":"요약","claims":vec![claim.clone();41]}),
+            "claims",
+        ),
+        (
+            json!({"reply":"요약","decisions":vec![decision.clone();21]}),
+            "decisions",
+        ),
+        (
+            json!({"reply":"요약","requirements":vec![requirement.clone();41]}),
+            "requirements",
+        ),
+        (
+            json!({"reply":"요약","questions":vec![json!({"target_ref":"scope","text":"범위는 무엇인가요?","reason":"확인합니다."});21]}),
+            "questions",
+        ),
+        (
+            json!({"reply":"요약","coverage_updates":vec![json!({"id":"scope","reason":"확인","source_quote":"도구","evidence_refs":["source"]});31]}),
+            "coverage_updates",
+        ),
+    ];
+    let mut value = claim.clone();
+    value["kind"] = json!("x".repeat(33));
+    cases.push((json!({"reply":"요약","claims":[value]}), "claims[0].kind"));
+    let mut value = claim.clone();
+    value["id"] = json!("");
+    cases.push((json!({"reply":"요약","claims":[value]}), "claims[0].id"));
+    let mut value = claim;
+    value["evidence_refs"] = json!(vec!["source"; 41]);
+    cases.push((
+        json!({"reply":"요약","claims":[value]}),
+        "claims[0].evidence_refs",
+    ));
+    let mut value = requirement.clone();
+    value["acceptance"] = json!("x".repeat(8193));
+    cases.push((
+        json!({"reply":"요약","requirements":[value]}),
+        "requirements[0].acceptance",
+    ));
+    let mut value = decision.clone();
+    value["alternatives"] = json!(vec!["alternative"; 6]);
+    cases.push((
+        json!({"reply":"요약","decisions":[value]}),
+        "decisions[0].alternatives",
+    ));
+    let mut value = decision;
+    value["requirement_refs"] = json!(["가".repeat(67)]);
+    cases.push((
+        json!({"reply":"요약","decisions":[value]}),
+        "decisions[0].requirement_refs[0]",
+    ));
+    cases.push((json!({"reply":"요약","coverage_updates":[{"id":"scope","reason":"확인","source_quote":"x".repeat(8193),"evidence_refs":["source"]}]}),"coverage_updates[0].source_quote"));
+    let mut value = requirement;
+    value["acceptance"] = json!("x".repeat(8000));
+    cases.push((
+        json!({"reply":"요약","requirements":vec![value;40]}),
+        "candidate.text_budget",
+    ));
+    for (value, path) in cases {
+        let error = domain::apply_conversation(&mut s, candidate(value))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with(&format!("{path}: observed ")), "{error}");
+        assert!(
+            error.contains("limit ") || error.contains("minimum "),
+            "{error}"
+        );
+        assert_eq!(serde_json::to_value(&s).unwrap(), before);
+    }
+}
