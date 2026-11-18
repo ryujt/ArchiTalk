@@ -22,5 +22,8 @@
 | SmartMD 문서 생성·형식 계약 | [smartmd-documents-20261118](smartmd-documents-20261118.md) | focused 11건·독립 반례 검토 통과 |
 | 원본 mdview 변환기와 실제 문서 호환 | [smartmd-renderer-20261118](smartmd-renderer-20261118.md) | 대표 문서 6건·실제 Codex 문서의 7블록 변환 통과 |
 | 대화 화면·문서 생성 최종 조립·전역 설치 | [conversation-docs-integration-20261118](conversation-docs-integration-20261118.md) | Rust 80건·브라우저 8건·실제 Codex 설계 1회·전역 설치 통과 |
+| 앱 내 Markdown·SmartMD renderer | [document-renderer](document-renderer-20261118.md) | 실제 renderer·정화·소스 검토 통과 |
+| 앱 렌더링·도표·적대적 문서 브라우저 | [document-rendering-browser](document-rendering-browser-20261118.md) | 원문 표시 재현·수정, 최종 12건 통과 |
+| renderer HTTP·자산·앱 조립 | [document-rendering-integration](document-rendering-integration-20261118.md) | Node 21·Rust 80·clippy·브라우저 통과 |
 
 최초 작업으로 참고할 이전 실행은 없었다. 후속 실행은 각 기록의 미검증·후속 조건을 먼저 확인한다.

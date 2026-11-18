@@ -186,6 +186,7 @@ export function startWorkspace(doc = document, win = window) {
     restoreFocus: false, dialogScroll: null, runScene: 'interview', disposed: false
   };
   let renderedScene = null, renderedConversation = null, followConversation = false;
+  let documentPreview = null, documentRenderer = null;
   const dialog = $('scene-dialog');
   const draft = () => list(state.session?.drafts).find(d => d.id === state.selectedDraft) || list(state.session?.drafts).at(-1);
   const approvalIssues = () => draft()?.id === list(state.session?.drafts).at(-1)?.id && Array.isArray(state.session?.readiness_issues) ? state.session.readiness_issues : approvalBlockers(state.session,draft());
@@ -394,12 +395,13 @@ export function startWorkspace(doc = document, win = window) {
     for (const name of ['interview','review','save']) $('step-'+name).classList.toggle('active', name === (['review','saved'].includes(state.scene) ? state.scene === 'saved' ? 'save' : 'review' : 'interview'));
     renderSessions(); renderNotice();
     const content = $('workspace-content');
-    // Only trusted templates become markup; all project, AI, and server strings
-    // pass through esc(). Markdown is deliberately displayed as plain text.
+    // Templates and source text are escaped. The document renderer separately
+    // sanitizes the rich preview before it enters the application DOM.
     const focused = doc.activeElement;
     const editing = focused?.id === 'answer-input' || focused?.id === 'project-intro';
     const selection = editing ? [focused.selectionStart, focused.selectionEnd] : null;
     content.innerHTML = renderStage();
+    renderDocumentPreview(content);
     if (editing) {
       const replacement = $(focused.id);
       if (replacement) { replacement.focus({preventScroll: true}); replacement.setSelectionRange(...selection); }
@@ -423,6 +425,31 @@ export function startWorkspace(doc = document, win = window) {
       // reading older messages during a snapshot or modal update.
       win.scrollTo?.(scroll);
     }
+  }
+
+  function renderDocumentPreview(content) {
+    const target=content.querySelector?.('[data-document-preview]');
+    if (!target) { documentPreview=null; return; }
+    const current=draft();
+    if (!current) return;
+    if (documentPreview?.sessionId===state.session.id && documentPreview.draftId===current.id && documentPreview.markdown===current.markdown) {
+      target.replaceWith(documentPreview.node);
+      return;
+    }
+    documentPreview={sessionId:state.session.id,draftId:current.id,markdown:current.markdown,node:target};
+    documentRenderer ||= import('./document-renderer.js');
+    void documentRenderer.then(({renderDocument})=> {
+      if (!state.disposed && target.isConnected) return renderDocument(target,current.markdown);
+    }).catch(()=> {
+      if (!state.disposed && target.isConnected) {
+        target.dataset.renderState='error'; target.setAttribute('aria-busy','false');
+        target.textContent='문서를 표시하지 못했어요. 아래의 Markdown 원문을 확인하거나 화면을 새로고침해 주세요.';
+      }
+    });
+  }
+
+  function inDocumentPreview(target) {
+    return target.closest?.('[data-document-preview]')?.dataset?.documentPreview !== undefined;
   }
 
   function renderSessions() {
@@ -491,7 +518,7 @@ export function startWorkspace(doc = document, win = window) {
     const currentDraft = draft(), current = draftIsCurrent(state.session,currentDraft);
     const approved = currentDraft.content_status === 'approved';
     const issues = approvalIssues();
-    return `<p class="intro">완성된 초안을 살펴보고, 바꾸고 싶은 내용은 대화로 들려주세요.</p><article class="document-preview"><div class="document-toolbar"><span>▤ 아키텍처 설계</span><select class="draft-picker" id="draft-picker" aria-label="초안 버전 선택">${list(state.session.drafts).map((item,i)=>`<option value="${esc(item.id)}"${item.id===currentDraft.id?' selected':''}>초안 ${i+1} · 설계 기록 ${esc(item.input_revision)}</option>`).join('')}</select><span>${approved?'검토본':current?'현재 대화 기준 초안':'이전 대화 기준 초안'}</span></div><div class="document-paper"><p class="doc-label">설계 기록 ${esc(currentDraft.input_revision)} 기준${current?' · 현재 대화와 일치':' · 새 답변 반영 필요'}</p><pre class="markdown">${esc(currentDraft.markdown)}</pre></div></article>${findings()}${issues.length?`<details class="warning-box"><summary>검토본 확정 전에 확인할 내용 · ${issues.length}개</summary><ul>${issues.map(issue=>`<li>${esc(issue)}</li>`).join('')}</ul></details>`:''}<div class="review-actions"><p class="review-note">내용 확정과 파일 저장은 별개예요.<br>${approved?'현재 설계 기록의 내용을 검토본으로 확정했어요.':current?'초안으로 저장하면 가정과 미정을 그대로 남겨요.':'이전 초안을 그대로 저장할 수 있어요. 현재 버전 확정은 다시 정리한 뒤 가능해요.'}</p><div class="button-row">${button('approve',approved?'검토본 확정됨':'이 버전을 검토본으로 확정','secondary',state.busy||approved||!canApprove())}${button('save-preview','문서에 반영 ↗','primary',state.busy||runIsActive(state.run))}</div></div>${pending?pendingMessage():''}${composer()}${button('interview','대화 기록 살펴보기','quiet-button')}`;
+    return `<p class="intro">완성된 초안을 살펴보고, 바꾸고 싶은 내용은 대화로 들려주세요.</p><article class="document-preview"><div class="document-toolbar"><span>▤ 아키텍처 설계</span><select class="draft-picker" id="draft-picker" aria-label="초안 버전 선택">${list(state.session.drafts).map((item,i)=>`<option value="${esc(item.id)}"${item.id===currentDraft.id?' selected':''}>초안 ${i+1} · 설계 기록 ${esc(item.input_revision)}</option>`).join('')}</select><span>${approved?'검토본':current?'현재 대화 기준 초안':'이전 대화 기준 초안'}</span></div><div class="document-paper"><p class="doc-label">설계 기록 ${esc(currentDraft.input_revision)} 기준${current?' · 현재 대화와 일치':' · 새 답변 반영 필요'}</p><div class="markdown" data-document-preview data-render-state="loading" aria-busy="true"><p role="status">문서를 표시하고 있어요…</p></div><details class="document-source"><summary>Markdown 원문 보기</summary><pre>${esc(currentDraft.markdown)}</pre></details></div></article>${findings()}${issues.length?`<details class="warning-box"><summary>검토본 확정 전에 확인할 내용 · ${issues.length}개</summary><ul>${issues.map(issue=>`<li>${esc(issue)}</li>`).join('')}</ul></details>`:''}<div class="review-actions"><p class="review-note">내용 확정과 파일 저장은 별개예요.<br>${approved?'현재 설계 기록의 내용을 검토본으로 확정했어요.':current?'초안으로 저장하면 가정과 미정을 그대로 남겨요.':'이전 초안을 그대로 저장할 수 있어요. 현재 버전 확정은 다시 정리한 뒤 가능해요.'}</p><div class="button-row">${button('approve',approved?'검토본 확정됨':'이 버전을 검토본으로 확정','secondary',state.busy||approved||!canApprove())}${button('save-preview','문서에 반영 ↗','primary',state.busy||runIsActive(state.run))}</div></div>${pending?pendingMessage():''}${composer()}${button('interview','대화 기록 살펴보기','quiet-button')}`;
   }
 
   function findings() {
@@ -692,6 +719,7 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   doc.addEventListener('click', event => {
+    if (inDocumentPreview(event.target)) return;
     const target = event.target.closest('button'); if (!target) return;
     if (target.dataset.session) { void selectSession(target.dataset.session); return; }
     if (target.dataset.panel) { state.panel=target.dataset.panel; renderAux(); return; }
@@ -775,6 +803,7 @@ export function startWorkspace(doc = document, win = window) {
   });
 
   doc.addEventListener('submit', event => {
+    if (inDocumentPreview(event.target)) return;
     if (!['start-form','answer-form','settings-form','save-form','finding-form','coverage-form'].includes(event.target.id)) return;
     event.preventDefault(); const form=event.target;
     if (!form.reportValidity()) return;
@@ -818,6 +847,7 @@ export function startWorkspace(doc = document, win = window) {
   });
 
   doc.addEventListener('input',event=> {
+    if (inDocumentPreview(event.target)) return;
     if (state.modal==='settings' && /^(claude|codex|conversation|design|critic)-(model|effort)$/.test(event.target.id)) {
       const choice=$(`${event.target.id}-choice`), value=event.target.value.trim();
       choice.value=Array.from(choice.options).some(option=>option.value===value)?value:'';
@@ -830,6 +860,7 @@ export function startWorkspace(doc = document, win = window) {
     }
   });
   doc.addEventListener('change',event=> {
+    if (inDocumentPreview(event.target)) return;
     if (state.modal==='settings') {
       if (event.target.dataset.choiceInput && event.target.value) $(event.target.dataset.choiceInput).value=event.target.value;
       if (/^(default|conversation|design|critic)-backend$/.test(event.target.id)) refreshSettingChoices();
@@ -840,6 +871,7 @@ export function startWorkspace(doc = document, win = window) {
 
   });
   doc.addEventListener('keydown',event=> {
+    if (inDocumentPreview(event.target)) return;
     if (event.target.id==='answer-input' && event.key==='Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); event.target.form.requestSubmit(); }
     if (event.target.matches('[role="tab"]') && ['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) {
       event.preventDefault(); state.panel=event.key==='Home'?'notes':event.key==='End'?'documents':state.panel==='notes'?'documents':'notes'; renderAux(); $(state.panel+'-tab').focus();

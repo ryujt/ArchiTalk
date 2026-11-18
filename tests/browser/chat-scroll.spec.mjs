@@ -115,7 +115,7 @@ test('a conversation after an existing draft opens the new reply and its compose
     const snapshot=await server.workspace();
     return snapshot.sessions[0]?.drafts[0]?.reviewed&&snapshot.active_run===null;
   }).toBe(true);
-  await expect(page.locator('.markdown')).toContainText('# 알림 서비스 아키텍처');
+  await expect(page.locator('.markdown h1')).toHaveText('알림 서비스 아키텍처');
   await page.locator('[data-action="interview"]').click();
   await expect(page.locator('.chat-turn')).toHaveCount(2);
   await page.locator('#answer-input').fill(longMessage(2));

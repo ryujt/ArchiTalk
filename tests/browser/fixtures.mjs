@@ -46,6 +46,10 @@ async function startServer() {
   }
   return {
     ...endpoint,project,
+    async configureDocumentFixture(markdown){
+      if(typeof markdown!=='string'||Buffer.byteLength(markdown)>500_000)throw new Error('Invalid isolated document fixture.');
+      await writeFile(join(tools,'architecture.smart.md'),markdown);
+    },
     async configureSlowFixture(seconds=2){
       if(!Number.isFinite(seconds)||seconds<=0||seconds>30)throw new Error('Fixture delay must be between 0 and 30 seconds.');
       const source=await readFile(executable,'utf8');

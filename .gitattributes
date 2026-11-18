@@ -1,0 +1,2 @@
+# Preserve exact upstream bundles and license text, including literal whitespace.
+web/vendor/** -whitespace

@@ -67,6 +67,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/", get(index))
         .route("/app.js", get(script))
         .route("/style.css", get(style))
+        .route("/document-renderer.js", get(document_renderer))
+        .route("/document.css", get(document_style))
+        .route("/diagrams/{name}", get(diagram_asset))
+        .route("/vendor/{name}", get(vendor_asset))
         .nest("/api/v1", api)
         .layer(DefaultBodyLimit::max(128 * 1024))
         .layer(middleware::from_fn_with_state(
@@ -89,6 +93,81 @@ async fn style() -> impl IntoResponse {
         [("content-type", "text/css; charset=utf-8")],
         include_str!("../web/style.css"),
     )
+}
+async fn document_renderer() -> impl IntoResponse {
+    javascript(include_str!("../web/document-renderer.js"))
+}
+async fn document_style() -> impl IntoResponse {
+    (
+        [("content-type", "text/css; charset=utf-8")],
+        include_str!("../web/document.css"),
+    )
+}
+fn javascript(source: &'static str) -> Response {
+    ([("content-type", "text/javascript; charset=utf-8")], source).into_response()
+}
+async fn diagram_asset(Path(name): Path<String>) -> Response {
+    if name == "provenance.txt" {
+        return (
+            [("content-type", "text/plain; charset=utf-8")],
+            include_str!("../web/diagrams/README.md"),
+        )
+            .into_response();
+    }
+    let source = match name.as_str() {
+        "smartmd.js" => include_str!("../web/diagrams/smartmd.js"),
+        "block-parser.js" => include_str!("../web/diagrams/block-parser.js"),
+        "cjk-emphasis.js" => include_str!("../web/diagrams/cjk-emphasis.js"),
+        "jobflow.js" => include_str!("../web/diagrams/jobflow.js"),
+        "layout.js" => include_str!("../web/diagrams/layout.js"),
+        "state.js" => include_str!("../web/diagrams/state.js"),
+        "navigation.js" => include_str!("../web/diagrams/navigation.js"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    javascript(source)
+}
+async fn vendor_asset(Path(name): Path<String>) -> Response {
+    let notice = match name.as_str() {
+        "manifest.json" => Some((
+            "application/json; charset=utf-8",
+            include_str!("../web/vendor/manifest.json"),
+        )),
+        "THIRD-PARTY-NOTICES.txt" => Some((
+            "text/plain; charset=utf-8",
+            include_str!("../web/vendor/THIRD-PARTY-NOTICES.txt"),
+        )),
+        "marked.LICENSE.txt" => Some((
+            "text/plain; charset=utf-8",
+            include_str!("../web/vendor/marked.LICENSE.txt"),
+        )),
+        "dompurify.LICENSE.txt" => Some((
+            "text/plain; charset=utf-8",
+            include_str!("../web/vendor/dompurify.LICENSE.txt"),
+        )),
+        "mermaid.LICENSE.txt" => Some((
+            "text/plain; charset=utf-8",
+            include_str!("../web/vendor/mermaid.LICENSE.txt"),
+        )),
+        "dompurify.js.LEGAL.txt" => Some((
+            "text/plain; charset=utf-8",
+            include_str!("../web/vendor/dompurify.js.LEGAL.txt"),
+        )),
+        "mermaid.js.LEGAL.txt" => Some((
+            "text/plain; charset=utf-8",
+            include_str!("../web/vendor/mermaid.js.LEGAL.txt"),
+        )),
+        _ => None,
+    };
+    if let Some((mime, source)) = notice {
+        return ([("content-type", mime)], source).into_response();
+    }
+    let source = match name.as_str() {
+        "marked.js" => include_str!("../web/vendor/marked.js"),
+        "dompurify.js" => include_str!("../web/vendor/dompurify.js"),
+        "mermaid.js" => include_str!("../web/vendor/mermaid.js"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    javascript(source)
 }
 fn same_origin(state: &ServerState, request: &Request) -> bool {
     if request.headers().get("host").and_then(|h| h.to_str().ok()) != Some(state.authority.as_str())
@@ -120,7 +199,7 @@ async fn security_headers(
     }
     let mut response = next.run(request).await;
     let h = response.headers_mut();
-    h.insert("content-security-policy",HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"));
+    h.insert("content-security-policy",HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"));
     h.insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),

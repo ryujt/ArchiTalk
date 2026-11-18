@@ -49,7 +49,7 @@ test('real local UI persists a draft, next-run settings and recovery without mod
     const snapshot=await server.workspace();
     return snapshot.runs.some(run=>run.kind==='critic'&&run.status==='completed')&&snapshot.sessions[0].drafts[0]?.reviewed;
   }).toBe(true);
-  await expect(page.locator('.markdown')).toContainText('# 알림 서비스 아키텍처');
+  await expect(page.locator('.markdown').getByRole('heading',{name:'알림 서비스 아키텍처',exact:true})).toBeVisible();
   await expect(page.locator('[data-action="approve"]')).toBeDisabled();
   await noOverflow(page);await screenshot(page,testInfo,'02-review');
   await page.locator('[data-action="save-preview"]').click();
@@ -116,7 +116,7 @@ test('real local UI persists a draft, next-run settings and recovery without mod
   expect((await server.workspace()).runs).toHaveLength(count);
   await noOverflow(page);await screenshot(page,testInfo,'05-recovery');
   await page.getByRole('button',{name:'초안 먼저 살펴보기',exact:true}).click();
-  await expect(page.locator('.markdown')).toContainText('# 알림 서비스 아키텍처');
+  await expect(page.locator('.markdown').getByRole('heading',{name:'알림 서비스 아키텍처',exact:true})).toBeVisible();
   if(mobile){
     await page.getByRole('button',{name:'설계 메모',exact:true}).click();
     await expect(page.locator('#aux-panel')).toBeVisible();await noOverflow(page);
