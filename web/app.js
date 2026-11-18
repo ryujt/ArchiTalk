@@ -1,6 +1,6 @@
 const API_ROOT = '/api/v1/';
 const TOKEN_KEY = 'architalk.authorization';
-const SESSION_KEY = 'architalk.session';
+const LEGACY_SESSION_KEY = 'architalk.session';
 const ACTIVE_STATUSES = new Set(['queued', 'running', 'cancelling', 'starting']);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
 const idPath = value => encodeURIComponent(String(value));
@@ -11,10 +11,12 @@ export function takeToken(location, history, storage) {
   const supplied = params.get('token');
   // Remove the capability before making any requests or updating the page.
   if (supplied !== null) history.replaceState(null, '', `${location.pathname}${location.search}`);
-  let token = supplied || '';
+  let token = supplied ?? '';
   try {
-    if (token) storage.setItem(TOKEN_KEY, token);
-    else token = storage.getItem(TOKEN_KEY) || '';
+    if (supplied !== null) {
+      if (token) storage.setItem(TOKEN_KEY, token);
+      else storage.removeItem?.(TOKEN_KEY);
+    } else token = storage.getItem(TOKEN_KEY) || '';
   } catch { /* Private-mode storage may be unavailable; the in-memory token works. */ }
   return token;
 }
@@ -158,8 +160,7 @@ export function settingsFromValues(current, values) {
   return settings;
 }
 
-function storedSession(storage) { try { return storage.getItem(SESSION_KEY); } catch { return null; } }
-function rememberSession(storage, id) { try { id ? storage.setItem(SESSION_KEY, id) : storage.removeItem(SESSION_KEY); } catch {} }
+
 function runIsActive(run) { return Boolean(run && ACTIVE_STATUSES.has(run.status)); }
 function unknownTermination(run) { return Boolean(run && (run.process_termination === 'unknown' || run.termination === 'unknown')); }
 function describeStatus(run) {
@@ -201,9 +202,12 @@ export function startWorkspace(doc = document, win = window) {
   let storage;
   try { storage = win.sessionStorage; } catch {}
   const token = takeToken(win.location, win.history, storage);
-  const api = createApi(token, win.fetch.bind(win));
+  const transportApi = createApi(token, win.fetch.bind(win));
+  // Selection is project state; keep it in this page only. Retire the old key.
+  try { storage?.removeItem(LEGACY_SESSION_KEY); } catch {}
   const state = {
     workspace: null, session: null, run: null, scene: 'loading', panel: 'notes',
+    workspaceEpoch: 0, connectionBlocked: false, connectionError: null,
     selectedDraft: null, selectedDocument: 'architecture', documentAnchor: null, busy: false, error: null, notice: '', live: '', progress: '',
     connection: 'connecting', modal: null, modalError: '', settings: null,
     diagnostics: null, choices: {}, settingsRevision: null, plan: null, saved: null,
@@ -226,16 +230,60 @@ export function startWorkspace(doc = document, win = window) {
   const approvalIssues = () => draft()?.id === list(state.session?.drafts).at(-1)?.id && Array.isArray(state.session?.readiness_issues) ? state.session.readiness_issues : approvalBlockers(state.session,draft());
   const canApprove = () => !approvalIssues().length && !runIsActive(state.run) && !unknownTermination(state.run);
   const globalRun = () => state.workspace?.active_run;
-  const disabled = () => state.busy || runIsActive(state.run) || unknownTermination(state.run) || runIsActive(globalRun()) || unknownTermination(globalRun());
+  const disabled = () => state.connectionBlocked || state.busy || runIsActive(state.run) || unknownTermination(state.run) || runIsActive(globalRun()) || unknownTermination(globalRun());
   const envelope = (payload, revision = state.session?.revision) => ({command_id: win.crypto.randomUUID(), expected_revision: revision, payload});
   const sessionPath = suffix => `${API_ROOT}sessions/${idPath(state.session.id)}${suffix}`;
 
+  async function api(path, options = {}) {
+    if (state.connectionBlocked) throw state.connectionError;
+    const epoch = state.workspaceEpoch;
+    try {
+      const result = await transportApi(path, options);
+      if (state.connectionBlocked) throw state.connectionError;
+      if (epoch !== state.workspaceEpoch) throw new ApiError(409, {error:{code:'workspace_view_changed',message:'프로젝트 기록이 바뀌었어요. 새 기록에서 다시 시작해 주세요.'}});
+      return result;
+    } catch (error) {
+      if (error instanceof ApiError && (error.code === 'workspace_reset_required' || error.status === 401)) invalidateConnection(error);
+      throw error;
+    }
+  }
+
+  function clearProjectView(workspace = null) {
+    state.requestEpoch++; state.workspaceEpoch++;
+    state.feed?.abort(); state.feed = null;
+    win.clearTimeout(state.refreshTimer); state.refreshTimer = null;
+    win.clearTimeout(state.diagnosticTimer); state.diagnosticTimer = null;
+    state.workspace = workspace; state.session = null; state.run = null;
+    state.selectedDraft = null; state.selectedDocument = 'architecture'; state.documentAnchor = null;
+    state.plan = null; state.saved = null; state.lastExport = null;
+    state.live = ''; state.progress = ''; state.answer = ''; state.intro = ''; state.cursor = '';
+    state.contextPaths.clear(); state.notice = ''; state.error = null; state.busy = false;
+    state.modal = null; state.modalError = ''; state.dialogFocus = null; state.dialogFocusAction = null;
+    state.restoreFocus = false; state.dialogScroll = null;
+    if (dialog.open) dialog.close();
+    dialog.innerHTML = ''; delete dialog.dataset.modal;
+    documentPreview = null; renderedScene = null; renderedConversation = null; followConversation = false;
+    state.scene = 'welcome';
+  }
+
+  function invalidateConnection(error) {
+    if (state.connectionBlocked) return;
+    clearProjectView();
+    state.connectionBlocked = true; state.connectionError = error; state.scene = 'disconnected';
+    try { storage?.removeItem(TOKEN_KEY); storage?.removeItem(LEGACY_SESSION_KEY); } catch {}
+    connection('offline'); render();
+    announce(error.code === 'connection_replaced' ? '새 서버에 연결하고 있어요.' : '이전 프로젝트 기록을 비웠어요. 서버를 다시 실행하고 새 접속 주소를 열어 주세요.');
+    $('main')?.focus?.({preventScroll:true});
+    win.scrollTo?.({left:0, top:0, behavior:'instant'});
+  }
+
   function announce(text) { $('announcer').textContent = text; }
   function connection(status) {
+    if (state.connectionBlocked) status = 'disconnected';
     state.connection = status;
     const el = $('connection');
     el.dataset.state = status === 'connected' ? 'online' : 'offline';
-    el.lastElementChild.textContent = ({connecting:'연결 확인 중', connected:'로컬에 연결됨', polling:'재연결 · 상태 확인 중', offline:'연결 확인 필요'})[status] || status;
+    el.lastElementChild.textContent = ({disconnected:'새 접속 필요', connecting:'연결 확인 중', connected:'로컬에 연결됨', polling:'재연결 · 상태 확인 중', offline:'연결 확인 필요'})[status] || status;
     if (state.workspace || state.scene!=='loading') renderNotice();
   }
 
@@ -254,6 +302,7 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   async function refresh({initial = false, keep = true} = {}) {
+    if (state.connectionBlocked) return;
     if (state.refreshPromise) {
       await state.refreshPromise;
       return refresh({initial,keep});
@@ -264,13 +313,13 @@ export function startWorkspace(doc = document, win = window) {
       if (epoch !== state.requestEpoch) return;
       state.workspace = workspace;
       const sessions = list(workspace.sessions);
-      const wanted = state.session?.id || (initial ? storedSession(storage) : null);
+      const wanted = state.session?.id;
       const selected = sessions.find(s => s.id === wanted) || (initial ? sessions.at(-1) : null);
       if (selected) {
         const session = await api(`${API_ROOT}sessions/${idPath(selected.id)}`);
         if (epoch !== state.requestEpoch) return;
         state.session = session.session || session;
-        const runId = state.session.active_run_id || (workspace.active_run?.session_id === state.session.id ? workspace.active_run.id : null) || list(workspace.runs).filter(run=>run.session_id===state.session.id).at(-1)?.id || state.run?.id;
+        const runId = state.session.active_run_id || (workspace.active_run?.session_id === state.session.id ? workspace.active_run.id : null) || list(workspace.runs).filter(run=>run.session_id===state.session.id).at(-1)?.id;
         if (runId) {
           const run = await api(`${API_ROOT}runs/${idPath(runId)}`);
           if (epoch !== state.requestEpoch) return;
@@ -285,10 +334,10 @@ export function startWorkspace(doc = document, win = window) {
         } else state.run = null;
         const lastExport=list(workspace.exports).filter(entry=>entry.session_id===state.session.id).at(-1);
         state.lastExport=lastExport || null;
-        rememberSession(storage, state.session.id);
         if (!state.feed && state.session.cursor !== undefined) state.cursor=String(state.session.cursor);
         updateScene({recover: initial && !runIsActive(state.run), keep});
-      } else if (!state.session || initial) {
+      } else {
+        if (state.session) clearProjectView(workspace);
         state.session=null;
         state.run=workspace.active_run?.kind==='diagnostic'?workspace.active_run:null;
         state.scene=state.run?'diagnostic':'welcome';
@@ -301,6 +350,7 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function scheduleRefresh() {
+    if (state.connectionBlocked) return;
     if (state.refreshTimer) return;
     state.refreshTimer = win.setTimeout(() => {
       state.refreshTimer = null;
@@ -309,6 +359,7 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function ensureFeed() {
+    if (state.connectionBlocked) return;
     if (globalRun()?.kind==='diagnostic' && runIsActive(globalRun())) {
       if (!state.diagnosticTimer && !state.disposed) state.diagnosticTimer=win.setTimeout(()=> {
         state.diagnosticTimer=null;
@@ -327,7 +378,7 @@ export function startWorkspace(doc = document, win = window) {
 
   async function watchSession(sessionId, controller) {
     let failures = 0;
-    while (!controller.signal.aborted && !state.disposed) {
+    while (!controller.signal.aborted && !state.disposed && !state.connectionBlocked) {
       try {
         const path = `${API_ROOT}sessions/${idPath(sessionId)}/events${state.cursor ? `?after=${encodeURIComponent(state.cursor)}` : ''}`;
         const response = await api(path, {stream: true, signal: controller.signal});
@@ -336,6 +387,10 @@ export function startWorkspace(doc = document, win = window) {
           if (controller.signal.aborted || state.session?.id !== sessionId) return;
           let event;
           try { event = JSON.parse(frame.data); } catch { scheduleRefresh(); return; }
+          if (event.type === 'workspace_reset_required' || frame.event === 'workspace_reset_required') {
+            invalidateConnection(new ApiError(410, {error:{code:'workspace_reset_required',message:event.error?.message || '프로젝트 기록을 더 사용할 수 없어요.'}}));
+            return;
+          }
           if (event.session_id && event.session_id !== sessionId) return;
           if (event.event_id !== undefined) state.cursor = String(event.event_id);
           else if (frame.id !== undefined) state.cursor = frame.id;
@@ -350,7 +405,7 @@ export function startWorkspace(doc = document, win = window) {
         }, controller.signal);
         if (!controller.signal.aborted) throw new Error('진행 연결이 끝났어요.');
       } catch (error) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || state.connectionBlocked) return;
         connection('polling'); failures++;
         // A lost feed never creates another run. Reconcile durable snapshots and
         // poll while reconnecting; this also handles expired replay cursors.
@@ -366,6 +421,7 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function showError(error, modal = false) {
+    if (state.connectionBlocked) return;
     const message = error instanceof ApiError ? error.message : '로컬 서버와 상태를 확인하지 못했어요. 연결을 확인한 뒤 다시 확인해 주세요.';
     if (modal) state.modalError = message;
     else state.error = {message, code: error.code || 'CONNECTION_FAILED'};
@@ -373,7 +429,7 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   async function command(task, {modal = false} = {}) {
-    if (state.busy) return;
+    if (state.busy || state.connectionBlocked) return;
     state.busy = true; state.error = null; state.modalError = ''; render();
     try { await task(); }
     catch (error) {
@@ -390,20 +446,18 @@ export function startWorkspace(doc = document, win = window) {
     if (result.session || result.run) state.requestEpoch++;
     if (result.session) state.session = result.session;
     if (result.run) { state.run = result.run; state.live = ''; state.progress = ''; }
-    if (state.session) rememberSession(storage, state.session.id);
     if (reset) updateScene();
     ensureFeed();
   }
 
   async function selectSession(id) {
-    if (state.busy) return;
+    if (state.busy || state.connectionBlocked) return;
     state.requestEpoch++;
     state.feed?.abort(); state.feed = null; state.cursor = ''; state.run = null;
     state.selectedDraft = null; state.selectedDocument = 'architecture'; state.documentAnchor = null; state.answer = ''; state.error = null; state.saved=null; state.lastExport=null;
     await command(async () => {
       const session = await api(`${API_ROOT}sessions/${idPath(id)}`);
       state.session = session.session || session;
-      rememberSession(storage, state.session.id);
       state.scene = 'recovery';
       await refresh({keep: true});
       if (!runIsActive(state.run)) state.scene = 'recovery';
@@ -424,7 +478,7 @@ export function startWorkspace(doc = document, win = window) {
     $('sidebar-project').textContent = workspace?.project_name || '프로젝트';
     $('root-display').textContent = workspace?.root_display || '';
     $('workspace-title').textContent = state.session?.title || '프로젝트를 소개해 주세요';
-    const phase = ({loading:'연결 확인', welcome:'시작하기', recovery:'이어가기', diagnostic:'도구 진단 확인', interview:'이야기 나누기', generating:describeStatus(state.run), review:state.session?.content_status === 'approved' ? '검토본' : '초안 검토', paused:'중지 확인', error:'작업 확인', saved:'저장 완료'})[state.scene] || '설계';
+    const phase = ({disconnected:'새 접속 필요',loading:'연결 확인', welcome:'시작하기', recovery:'이어가기', diagnostic:'도구 진단 확인', interview:'이야기 나누기', generating:describeStatus(state.run), review:state.session?.content_status === 'approved' ? '검토본' : '초안 검토', paused:'중지 확인', error:'작업 확인', saved:'저장 완료'})[state.scene] || '설계';
     $('phase').textContent = phase;
     for (const name of ['interview','review','save']) $('step-'+name).classList.toggle('active', name === (['review','saved'].includes(state.scene) ? state.scene === 'saved' ? 'save' : 'review' : 'interview'));
     renderSessions(); renderNotice();
@@ -441,6 +495,7 @@ export function startWorkspace(doc = document, win = window) {
       if (replacement) { replacement.focus({preventScroll: true}); replacement.setSelectionRange(...selection); }
     }
     renderAux();
+    if (state.connectionBlocked) for (const control of doc.querySelectorAll?.('button,select,input,textarea') || []) control.disabled = true;
     if (state.modal) renderModal();
     if (state.restoreFocus && !state.modal) {
       state.restoreFocus=false;
@@ -500,6 +555,7 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function selectDocument(kind, anchor = null) {
+    if (state.connectionBlocked) return;
     if (!availableDocuments().some((document) => document.kind === kind)) return;
     state.selectedDocument = kind;
     state.documentAnchor = anchor ?? '';
@@ -519,6 +575,7 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function renderNotice() {
+    if (state.connectionBlocked) { $('notice').innerHTML = ''; return; }
     let html = '';
     if (!token) html += `<div class="notice error"><b>접속 권한을 확인해 주세요.</b><p>ArchiTalk를 실행한 터미널의 전체 접속 주소로 다시 열어 주세요.</p></div>`;
     if (state.error) html += `<div class="notice error" role="alert"><b>${esc(state.error.message)}</b><p class="small">${esc(state.error.code)}</p><div class="button-row">${button('refresh','상태 다시 확인')}${button('settings','도구 설정 확인','quiet-button')}</div></div>`;
@@ -530,6 +587,8 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function renderStage() {
+    if (state.connectionError?.code === 'connection_replaced') return `<p class="loading" role="status">새 서버에 연결하고 있어요…</p>`;
+    if (state.connectionBlocked) return `<section class="status-card"><div class="status-icon warn" aria-hidden="true">↶</div><h1>${state.connectionError?.code === 'workspace_reset_required' ? '프로젝트 기록 연결이 초기화됐어요' : '이전 서버 연결을 사용할 수 없어요'}</h1><p>${esc(state.connectionError?.message || '서버 연결을 다시 확인해 주세요.')}</p><p>ArchiTalk 서버를 종료한 뒤 해당 프로젝트에서 다시 실행하고, 터미널에 표시된 새 접속 주소를 열어 주세요.</p></section>`;
     if (state.scene === 'loading') return `<p class="loading" role="status">로컬 워크스페이스를 확인하고 있어요.</p>`;
     if (state.scene === 'welcome') return welcome();
     if (state.scene === 'recovery') return recovery();
@@ -682,7 +741,7 @@ export function startWorkspace(doc = document, win = window) {
 
   function settingsModal() {
     const settings = state.settings || {}, ai = settings.ai || {}, backends = ai.backends || {};
-    return `${header('답변에 사용할 도구')}<div class="dialog-body"><p>로컬 Claude Code 또는 Codex의 기존 로그인을 사용해요. 설치·help 진단은 로그인이나 모델 응답을 시험하지 않아요.</p><div id="modal-error">${modalError()}</div><form id="settings-form"><div class="form-field"><label for="default-backend">기본 도구</label><select id="default-backend" name="default-backend">${['claude','codex'].map(kind=>`<option value="${kind}"${(ai.default_backend||'claude')===kind?' selected':''}>${kind==='claude'?'Claude Code':'Codex'}</option>`).join('')}</select></div><div class="form-field"><label for="timeout-seconds">작업 시간 제한(초)</label><input id="timeout-seconds" name="timeout-seconds" type="number" min="10" max="600" step="1" required value="${esc(ai.timeout_seconds ?? '')}" aria-describedby="timeout-seconds-help"><small id="timeout-seconds-help">각 AI 요청을 기다리는 시간을 10~600초 사이의 정수로 설정해요. 변경은 다음 작업부터 적용돼요.</small></div><div class="diagnostics" id="cli-diagnostics">${diagnosticsHTML()}</div>${button('diagnose','설치·버전 진단','secondary',state.busy)}${['claude','codex'].map(kind=>{
+    return `${header('답변에 사용할 도구')}<div class="dialog-body"><p>로컬 Claude Code 또는 Codex의 기존 로그인을 사용해요. 설치·help 진단은 로그인이나 모델 응답을 시험하지 않아요. 에이전트·모델·생각 수준·시간 제한은 모든 프로젝트에 공통 적용되며, 문서 저장 폴더는 현재 프로젝트에만 적용돼요.</p><div id="modal-error">${modalError()}</div><form id="settings-form"><div class="form-field"><label for="default-backend">기본 도구</label><select id="default-backend" name="default-backend">${['claude','codex'].map(kind=>`<option value="${kind}"${(ai.default_backend||'claude')===kind?' selected':''}>${kind==='claude'?'Claude Code':'Codex'}</option>`).join('')}</select></div><div class="form-field"><label for="timeout-seconds">작업 시간 제한(초)</label><input id="timeout-seconds" name="timeout-seconds" type="number" min="10" max="600" step="1" required value="${esc(ai.timeout_seconds ?? '')}" aria-describedby="timeout-seconds-help"><small id="timeout-seconds-help">각 AI 요청을 기다리는 시간을 10~600초 사이의 정수로 설정해요. 변경은 다음 작업부터 적용돼요.</small></div><div class="diagnostics" id="cli-diagnostics">${diagnosticsHTML()}</div>${button('diagnose','설치·버전 진단','secondary',state.busy)}${['claude','codex'].map(kind=>{
       const base=backends[kind] || {};
       return `<section class="settings-section"><h3>${kind==='claude'?'Claude Code':'Codex'} 기본 설정</h3><div class="form-field"><label for="${kind}-executable">신뢰된 실행 파일</label><input id="${kind}-executable" readonly value="${esc(base.executable || kind)}"><small>실행 파일 변경은 터미널의 사용자 전역 설정에서 해 주세요.</small></div>${kind==='codex'?`<div class="form-field"><label for="codex-profile">Codex profile</label><input id="codex-profile" readonly value="${esc(base.profile || 'CLI 기본 profile')}"><small>신뢰된 사용자 전역 설정의 profile을 사용해요.</small></div>`:''}<div class="field-grid">${settingField(kind,'model',base.model,kind)}${settingField(kind,'effort',base.effort,kind)}</div><p class="capability-note">목록은 알려진 값의 예시예요. 계정·CLI·모델별 사용 가능 여부는 실제 요청에서 확인돼요. 목록에 없는 값도 직접 입력할 수 있어요.</p></section>`;
     }).join('')}<details class="settings-section" open><summary>역할마다 다르게 설정하기 · 선택</summary>${['conversation','design','critic'].map((role,i)=>{
@@ -773,15 +832,16 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function newSession() {
-    if (state.busy) return;
+    if (state.busy || state.connectionBlocked) return;
     state.requestEpoch++; state.feed?.abort(); state.feed=null;
     state.session=null; state.run=null; state.scene='welcome'; state.selectedDraft=null; state.selectedDocument='architecture'; state.documentAnchor=null;
     state.error=null; state.notice=''; state.cursor=''; state.answer=''; state.saved=null; state.lastExport=null;
     state.intro=''; state.contextPaths.clear();
-    rememberSession(storage,null); render(); $('project-intro')?.focus();
+    render(); $('project-intro')?.focus();
   }
 
   doc.addEventListener('click', event => {
+    if (state.connectionBlocked) return;
     if (inDocumentPreview(event.target)) return;
     const target = event.target.closest('button'); if (!target) return;
     if (target.dataset.session) { void selectSession(target.dataset.session); return; }
@@ -867,6 +927,7 @@ export function startWorkspace(doc = document, win = window) {
   });
 
   doc.addEventListener('submit', event => {
+    if (state.connectionBlocked) { event.preventDefault(); return; }
     if (inDocumentPreview(event.target)) return;
     if (!['start-form','answer-form','settings-form','save-form','finding-form','coverage-form'].includes(event.target.id)) return;
     event.preventDefault(); const form=event.target;
@@ -943,11 +1004,19 @@ export function startWorkspace(doc = document, win = window) {
     }
   });
   dialog.addEventListener('cancel',event=> { event.preventDefault(); closeModal(); });
+  win.addEventListener('hashchange',()=> {
+    if (!new URLSearchParams(win.location.hash.replace(/^#/, '')).has('token')) return;
+    // A fixed-port restart may change only the fragment, which does not create
+    // a new page. Rebootstrap without letting the old connection keep its view.
+    invalidateConnection(new ApiError(401,{error:{code:'connection_replaced',message:'새 서버에 연결하고 있어요.'}}));
+    state.disposed = true;
+    win.location.reload?.();
+  });
   win.addEventListener('online',()=> { void refresh({keep:false}).catch(()=>connection('offline')); });
   win.addEventListener('pagehide',()=> { state.disposed=true; state.feed?.abort(); win.clearTimeout(state.diagnosticTimer); win.clearTimeout(state.refreshTimer); });
 
   if (!token) { state.scene='welcome'; render(); connection('offline'); }
-  else void refresh({initial:true,keep:false}).then(()=>{if(!state.session)connection('connected');}).catch(error=> { state.scene='welcome'; connection('offline'); showError(error); });
+  else void refresh({initial:true,keep:false}).then(()=>{if(!state.session && !state.connectionBlocked)connection('connected');}).catch(error=> { if (state.connectionBlocked) return; state.scene='welcome'; connection('offline'); showError(error); });
   return {state,refresh,api};
 }
 

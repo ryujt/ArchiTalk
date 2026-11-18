@@ -27,6 +27,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match self.code.as_str() {
             "not_found" => StatusCode::NOT_FOUND,
+            "workspace_reset_required" => StatusCode::GONE,
             "revision_conflict" | "idempotency_conflict" | "run_busy" | "file_conflict" => {
                 StatusCode::CONFLICT
             }
@@ -238,6 +239,9 @@ async fn authorize(State(state): State<ServerState>, request: Request, next: Nex
         return AppError::new("forbidden", "동일한 로컬 화면에서만 변경할 수 있습니다.")
             .into_response();
     }
+    if let Err(error) = state.app.ensure_workspace_current() {
+        return error.into_response();
+    }
     next.run(request).await
 }
 async fn workspace(State(s): State<ServerState>) -> Result<Json<Value>, AppError> {
@@ -261,8 +265,8 @@ async fn run(
 ) -> Result<Json<Value>, AppError> {
     Ok(Json(s.app.run(&id)?))
 }
-async fn settings(State(s): State<ServerState>) -> Json<Value> {
-    Json(s.app.settings())
+async fn settings(State(s): State<ServerState>) -> Result<Json<Value>, AppError> {
+    Ok(Json(s.app.settings()?))
 }
 async fn diagnostics(State(s): State<ServerState>) -> Result<Json<Value>, AppError> {
     Ok(Json(s.app.diagnostics().await?))
@@ -334,14 +338,38 @@ fn event_stream(state: ServerState, sid: String, rid: Option<String>, mut cursor
         let mut tick=tokio::time::interval(Duration::from_secs(5));
         loop {
             match state.app.replay(Some(&sid),cursor) {
-                Ok(events)=>{for e in events {cursor=e.cursor;let value=json!({"event_id":cursor,"session_id":e.session_id,"run_id":rid,"type":"state","payload":{"kind":e.kind,"data":e.payload}});yield Ok::<Event,Infallible>(Event::default().id(cursor.to_string()).event("state").data(value.to_string()));}},
-                Err(_)=>{yield Ok(Event::default().event("error").data(json!({"type":"error","message":"상태 조회에 실패했습니다. 다시 연결하세요."}).to_string()));break;}
+                Ok(events)=>{for e in events {
+                    if let Err(error)=state.app.ensure_workspace_current() {
+                        yield Ok::<Event,Infallible>(Event::default().event(crate::storage::RESET_CODE).data(json!({"type":crate::storage::RESET_CODE,"error":{"code":error.code,"message":error.message}}).to_string()));
+                        return;
+                    }
+                    cursor=e.cursor;let value=json!({"event_id":cursor,"session_id":e.session_id,"run_id":rid,"type":"state","payload":{"kind":e.kind,"data":e.payload}});yield Ok::<Event,Infallible>(Event::default().id(cursor.to_string()).event("state").data(value.to_string()));
+                }},
+                Err(error)=>{
+                    if error.code==crate::storage::RESET_CODE {
+                        yield Ok(Event::default().event(crate::storage::RESET_CODE).data(json!({"type":crate::storage::RESET_CODE,"error":{"code":error.code,"message":error.message}}).to_string()));
+                    } else {
+                        yield Ok(Event::default().event("error").data(json!({"type":"error","message":"상태 조회에 실패했습니다. 다시 연결하세요."}).to_string()));
+                    }
+                    break;
+                }
             }
             tokio::select!{
-                _=state.app.shutdown.cancelled()=>{break;},
+                _=state.app.shutdown.cancelled()=>{
+                    if let Err(error)=state.app.ensure_workspace_current() {
+                        yield Ok(Event::default().event(crate::storage::RESET_CODE).data(json!({"type":crate::storage::RESET_CODE,"error":{"code":error.code,"message":error.message}}).to_string()));
+                    }
+                    break;
+                },
                 _=tick.tick()=>{},
                 event=receiver.recv()=>{match event{
-                    Ok(e) if e.session_id==sid && e.run_id.is_some() && (rid.is_none()||e.run_id==rid)=>{let value=json!({"session_id":sid,"run_id":e.run_id,"type":e.kind,"payload":e.payload});yield Ok(Event::default().event(&e.kind).data(value.to_string()));},
+                    Ok(e) if e.session_id==sid && e.run_id.is_some() && (rid.is_none()||e.run_id==rid)=>{
+                        if let Err(error)=state.app.ensure_workspace_current() {
+                            yield Ok(Event::default().event(crate::storage::RESET_CODE).data(json!({"type":crate::storage::RESET_CODE,"error":{"code":error.code,"message":error.message}}).to_string()));
+                            break;
+                        }
+                        let value=json!({"session_id":sid,"run_id":e.run_id,"type":e.kind,"payload":e.payload});yield Ok(Event::default().event(&e.kind).data(value.to_string()));
+                    },
                     Ok(_)=>{},
                     Err(broadcast_error)=>{if matches!(broadcast_error,tokio::sync::broadcast::error::RecvError::Closed){break;}yield Ok(Event::default().event("resync_required").data(json!({"type":"resync_required","session_id":sid}).to_string()));}
                 }}

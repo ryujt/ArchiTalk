@@ -407,14 +407,9 @@ fn store_derived_gateway_stays_on_original_root_after_regular_directory_swap() {
         gateway.read_selected(&["README.md".into()]).unwrap()[0].text,
         "original evidence"
     );
-    assert_eq!(
-        store
-            .project_files()
-            .unwrap()
-            .read_selected(&["README.md".into()])
-            .unwrap()[0]
-            .text,
-        "original evidence"
+    assert!(
+        store.project_files().is_err(),
+        "the Store refuses a replaced project name"
     );
     let p = gateway.preview("고정 root", "# Original", 1, "s").unwrap();
     let p = gateway.reserve(&p).unwrap();
@@ -426,9 +421,11 @@ fn store_derived_gateway_stays_on_original_root_after_regular_directory_swap() {
             .exists()
     );
     assert!(!project.join("docs").exists());
-    store
-        .commit_workspace(&serde_json::json!({"root":"original"}), None, None)
-        .unwrap();
+    assert!(
+        store
+            .commit_workspace(&serde_json::json!({"root":"original"}), None, None)
+            .is_err()
+    );
     assert!(!project.join(".architalk").exists());
 }
 #[test]

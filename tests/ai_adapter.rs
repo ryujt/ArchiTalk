@@ -35,6 +35,7 @@ prompt=sys.stdin.read()
         path.to_str().unwrap().to_owned()
     }
     fn spec(executable: String, root: &Path) -> RunSpec {
+        std::fs::create_dir_all(root.join(".architalk")).unwrap();
         RunSpec {
             backend: Backend::Claude,
             executable,
@@ -49,56 +50,189 @@ prompt=sys.stdin.read()
     fn success() -> &'static str {
         "print(json.dumps({'type':'system','subtype':'init','tools':[],'mcp_servers':[],'permissionMode':'dontAsk','model':'fake-model'}),flush=True)\nprint(json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':'OK'}]}}),flush=True)\nprint(json.dumps({'type':'result','subtype':'success','is_error':False,'result':'OK'}),flush=True)"
     }
-    async fn wait_file(path: &Path) {
+    async fn wait_runtime_record(root: &Path, name: &str) -> String {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !path.exists() {
+            loop {
+                if let Ok(entries) = std::fs::read_dir(root.join(".architalk/runtime")) {
+                    for entry in entries.flatten() {
+                        if let Ok(text) = std::fs::read_to_string(entry.path().join(name)) {
+                            if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
+                                return text;
+                            }
+                        }
+                    }
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .unwrap();
+        .unwrap()
     }
     #[tokio::test]
-    async fn product_runs_outside_project_with_stdin_and_denies_project_writes() {
+    async fn project_diagnostics_do_not_resurrect_missing_state_or_follow_runtime_symlinks() {
+        use std::os::unix::fs::symlink;
         let root = tempfile::tempdir().unwrap();
         let fixture = tempfile::tempdir().unwrap();
-        let record = fixture.path().join("record.json");
+        let outside = tempfile::tempdir().unwrap();
+        let executable = fake_cli(fixture.path(), "raise RuntimeError('model must not run')");
+        let diagnostic = ai::diagnose_in_project(Backend::Claude, &executable, root.path()).await;
+        assert!(!diagnostic.compatible);
+        assert!(
+            !root.path().join(".architalk").exists(),
+            "missing state must not be recreated"
+        );
+        symlink(outside.path(), root.path().join(".architalk")).unwrap();
+        let diagnostic = ai::diagnose_in_project(Backend::Claude, &executable, root.path()).await;
+        assert!(!diagnostic.compatible);
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        std::fs::remove_file(root.path().join(".architalk")).unwrap();
+        std::fs::create_dir(root.path().join(".architalk")).unwrap();
+        symlink(outside.path(), root.path().join(".architalk/runtime")).unwrap();
+        let diagnostic = ai::diagnose_in_project(Backend::Claude, &executable, root.path()).await;
+        assert!(!diagnostic.compatible);
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn project_preparation_restricts_version_and_help_writes_and_cleans_scratch() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".architalk")).unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let outside = fixture.path().join("outside-diagnostic-write");
+        let executable = fake_cli(fixture.path(), "raise RuntimeError('model must not run')");
+        let script = std::fs::read_to_string(&executable).unwrap();
+        let probe = format!(
+            "try:\n    open({},'w').write('forbidden')\n    raise RuntimeError('outside write escaped')\nexcept PermissionError:\n    pass\nwith open('diagnostic-private-write','w') as f:\n    f.write('allowed')\n",
+            serde_json::to_string(outside.to_str().unwrap()).unwrap()
+        );
+        let script = script.replace(
+            "if '--version' in sys.argv:",
+            &(probe + "if '--version' in sys.argv:"),
+        );
+        std::fs::write(&executable, script).unwrap();
+        let diagnostic = ai::diagnose_in_project(Backend::Claude, &executable, root.path()).await;
+        assert!(diagnostic.compatible, "{}", diagnostic.message);
+        assert!(!outside.exists());
+        assert_eq!(
+            std::fs::read_dir(root.path().join(".architalk/runtime"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn explicitly_supported_claude_patch_profiles_only_use_version_and_help() {
+        for version in ["2.1.326", "2.1.327"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let marker = fixture.path().join("unexpected-model-call");
+            let body = format!(
+                "open({},'w').write('called')",
+                serde_json::to_string(marker.to_str().unwrap()).unwrap()
+            );
+            let executable = fake_cli(fixture.path(), &body);
+            let script = std::fs::read_to_string(&executable)
+                .unwrap()
+                .replace("2.1.326 (Claude Code)", &format!("{version} (Claude Code)"));
+            std::fs::write(&executable, script).unwrap();
+            let diagnostic = ai::diagnose(Backend::Claude, &executable).await;
+            assert!(diagnostic.compatible, "{}", diagnostic.message);
+            assert_eq!(
+                diagnostic.version.as_deref(),
+                Some(format!("{version} (Claude Code)").as_str())
+            );
+            assert!(diagnostic.message.contains(version));
+            assert!(!marker.exists(), "diagnosis must never invoke a model");
+        }
+    }
+
+    #[tokio::test]
+    async fn unverified_patch_reports_observed_version_path_and_supported_profiles() {
+        let fixture = tempfile::tempdir().unwrap();
+        let executable = fake_cli(fixture.path(), "raise RuntimeError('model must not run')");
+        let script = std::fs::read_to_string(&executable)
+            .unwrap()
+            .replace("2.1.326 (Claude Code)", "2.1.999 (Claude Code)");
+        std::fs::write(&executable, script).unwrap();
+        let diagnostic = ai::diagnose(Backend::Claude, &executable).await;
+        assert!(!diagnostic.compatible);
+        assert!(diagnostic.message.contains("2.1.999"));
+        assert!(diagnostic.message.contains("2.1.326, 2.1.327"));
+        assert!(diagnostic.message.contains(&executable));
+        assert!(diagnostic.message.contains("No model was called"));
+    }
+
+    #[tokio::test]
+    async fn supported_patch_still_requires_each_restriction_option() {
+        let fixture = tempfile::tempdir().unwrap();
+        let executable = fake_cli(fixture.path(), "raise RuntimeError('model must not run')");
+        let script = std::fs::read_to_string(&executable)
+            .unwrap()
+            .replace("2.1.326 (Claude Code)", "2.1.327 (Claude Code)")
+            .replace("--restricted ", "");
+        std::fs::write(&executable, script).unwrap();
+        let diagnostic = ai::diagnose(Backend::Claude, &executable).await;
+        assert!(!diagnostic.compatible);
+        assert!(
+            diagnostic
+                .message
+                .contains("Required restriction option missing: --restricted")
+        );
+    }
+
+    #[tokio::test]
+    async fn product_only_writes_private_project_runtime_and_keeps_prompt_on_stdin() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
         let denied = root.path().join("forbidden.txt");
+        let shared = fixture.path().join("forbidden-shared-history.txt");
         let body = format!(
-            "record={}\nblocked=False\ntry:\n    open({},'w').write('forbidden')\nexcept PermissionError:\n    blocked=True\nwith open(record,'w') as out:\n    json.dump({{'cwd':os.getcwd(),'argv':sys.argv,'prompt':prompt,'blocked':blocked}},out)\n{}",
-            serde_json::to_string(record.to_str().unwrap()).unwrap(),
+            "blocked=[]\nfor target in [{},{}]:\n    try:\n        open(target,'w').write('forbidden')\n    except PermissionError:\n        blocked.append(target)\nwith open('runtime-proof','w') as out:\n    out.write('allowed')\nanswer=json.dumps({{'cwd':os.getcwd(),'argv':sys.argv,'prompt':prompt,'blocked':blocked,'tmp':os.environ.get('TMPDIR'),'traffic':os.environ.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'),'safe':os.environ.get('CLAUDE_CODE_SAFE_MODE')}})\n{}",
             serde_json::to_string(denied.to_str().unwrap()).unwrap(),
-            success()
+            serde_json::to_string(shared.to_str().unwrap()).unwrap(),
+            success().replace("'OK'", "answer")
         );
         let executable = fake_cli(fixture.path(), &body);
-        let (tx, _rx) = mpsc::channel(1); // Intentionally never drained.
+        let (tx, _rx) = mpsc::channel(1);
         let mut request = spec(executable, root.path());
         request.model = Some("vendor/future-model:2[1m]".into());
         request.effort = Some("future_2-high".into());
         let output = ai::generate(request, CancellationToken::new(), tx)
             .await
             .unwrap();
-        assert_eq!(output.text, "OK");
         assert_eq!(output.resolved_model.as_deref(), Some("fake-model"));
-        let record: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
-        assert_eq!(record["blocked"], true);
+        let record: serde_json::Value = serde_json::from_str(&output.text).unwrap();
+        assert_eq!(record["blocked"].as_array().unwrap().len(), 2);
         assert!(!denied.exists());
-        assert!(!Path::new(record["cwd"].as_str().unwrap()).starts_with(root.path()));
+        assert!(!shared.exists());
+        let cwd = Path::new(record["cwd"].as_str().unwrap());
+        assert!(
+            cwd.starts_with(
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .join(".architalk/runtime")
+            )
+        );
+        assert!(
+            !cwd.exists(),
+            "private scratch data is cleaned after the process terminates"
+        );
+        assert!(Path::new(record["tmp"].as_str().unwrap()).starts_with(cwd));
+        assert_eq!(record["traffic"], "1");
+        assert_eq!(record["safe"], "1");
         assert_eq!(record["prompt"], "test -- $(touch ignored)");
         let argv = record["argv"].as_array().unwrap();
         assert!(
             argv.windows(2)
-                .any(|a| { a[0] == "--model" && a[1] == "vendor/future-model:2[1m]" })
+                .any(|a| a[0] == "--model" && a[1] == "vendor/future-model:2[1m]")
         );
         assert!(
             argv.windows(2)
                 .any(|a| a[0] == "--effort" && a[1] == "future_2-high")
         );
         assert!(
-            !record["argv"]
-                .as_array()
-                .unwrap()
+            !argv
                 .iter()
                 .any(|x| x.as_str() == Some("test -- $(touch ignored)"))
         );
@@ -107,11 +241,7 @@ prompt=sys.stdin.read()
     async fn codex_requested_model_is_not_reported_as_resolved_without_cli_evidence() {
         let root = tempfile::tempdir().unwrap();
         let fixture = tempfile::tempdir().unwrap();
-        let record = fixture.path().join("argv.json");
-        let body = format!(
-            "with open({},'w') as out:\n    json.dump(sys.argv,out)\nprint(json.dumps({{'type':'thread.started'}}),flush=True)\nprint(json.dumps({{'type':'turn.started'}}),flush=True)\nprint(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text':'OK'}}}}),flush=True)\nprint(json.dumps({{'type':'turn.completed'}}),flush=True)",
-            serde_json::to_string(record.to_str().unwrap()).unwrap()
-        );
+        let body = "print(json.dumps({'type':'thread.started'}),flush=True)\nprint(json.dumps({'type':'turn.started'}),flush=True)\nprint(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps(sys.argv)}}),flush=True)\nprint(json.dumps({'type':'turn.completed'}),flush=True)".to_owned();
         let executable = fake_cli(fixture.path(), &body);
         let mut script = std::fs::read_to_string(&executable).unwrap();
         script=script.replace("2.1.326 (Claude Code)","codex-cli 0.169.0").replace("--print --output-format --include-partial-messages --safe-mode --restricted --strict-mcp-config --mcp-config --setting-sources --settings --tools --permission-mode --disable-slash-commands --no-session-persistence --effort", "--json --ignore-user-config --ignore-rules --ephemeral --sandbox --skip-git-repo-check --disable");
@@ -125,10 +255,28 @@ prompt=sys.stdin.read()
             let output = ai::generate(request, CancellationToken::new(), tx)
                 .await
                 .unwrap();
-            assert_eq!(output.text, "OK");
             assert_eq!(output.resolved_model, None);
-            let argv: Vec<String> =
-                serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+            let argv: Vec<String> = serde_json::from_str(&output.text).unwrap();
+            assert_eq!(argv.last().map(String::as_str), Some("-"));
+            for key in ["sqlite_home", "log_dir", "history.persistence"] {
+                let assignment = &argv
+                    .windows(2)
+                    .find(|a| a[0] == "-c" && a[1].starts_with(&format!("{key}=")))
+                    .unwrap()[1];
+                let parsed: toml::Value = toml::from_str(assignment).unwrap();
+                if key == "history.persistence" {
+                    assert_eq!(parsed["history"]["persistence"].as_str(), Some("none"));
+                } else {
+                    assert!(
+                        Path::new(parsed[key].as_str().unwrap()).starts_with(
+                            root.path()
+                                .canonicalize()
+                                .unwrap()
+                                .join(".architalk/runtime")
+                        )
+                    );
+                }
+            }
             assert!(argv.windows(2).any(|a| a == ["--model", "gpt-6.2-sol"]));
             let assignment = &argv
                 .windows(2)
@@ -143,11 +291,8 @@ prompt=sys.stdin.read()
     async fn cancellation_stops_cli_and_its_process_group() {
         let root = tempfile::tempdir().unwrap();
         let fixture = tempfile::tempdir().unwrap();
-        let record = fixture.path().join("pids.json");
-        let body = format!(
-            "child=subprocess.Popen(['/bin/sleep','120'])\nwith open({},'w') as out:\n    json.dump([os.getpid(),child.pid],out)\nchild.wait()",
-            serde_json::to_string(record.to_str().unwrap()).unwrap()
-        );
+
+        let body = "child=subprocess.Popen(['/bin/sleep','120'])\nwith open('pids.json','w') as out:\n    json.dump([os.getpid(),child.pid],out)\nchild.wait()".to_owned();
         let executable = fake_cli(fixture.path(), &body);
         let cancel = CancellationToken::new();
         let (tx, _rx) = mpsc::channel(1);
@@ -156,7 +301,8 @@ prompt=sys.stdin.read()
             cancel.clone(),
             tx,
         ));
-        wait_file(&record).await;
+        let pids: Vec<i32> =
+            serde_json::from_str(&wait_runtime_record(root.path(), "pids.json").await).unwrap();
         cancel.cancel();
         let error = tokio::time::timeout(Duration::from_secs(12), work)
             .await
@@ -164,7 +310,6 @@ prompt=sys.stdin.read()
             .unwrap()
             .unwrap_err();
         assert_eq!(error.code, "cancelled");
-        let pids: Vec<i32> = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
         if error.termination_unknown {
             let output = std::process::Command::new("/bin/ps")
                 .args([
@@ -193,21 +338,20 @@ prompt=sys.stdin.read()
     async fn timeout_kills_term_resistant_cli_and_does_not_retry() {
         let root = tempfile::tempdir().unwrap();
         let fixture = tempfile::tempdir().unwrap();
-        let record = fixture.path().join("pid");
-        let body = format!(
-            "signal.signal(signal.SIGTERM,signal.SIG_IGN)\nwith open({},'w') as out:\n    out.write(str(os.getpid()))\ntime.sleep(120)",
-            serde_json::to_string(record.to_str().unwrap()).unwrap()
-        );
+
+        let body = "signal.signal(signal.SIGTERM,signal.SIG_IGN)\nwith open('pid','w') as out:\n    out.write(str(os.getpid()))\ntime.sleep(120)".to_owned();
         let executable = fake_cli(fixture.path(), &body);
         let mut request = spec(executable, root.path());
         request.timeout_seconds = 1;
         let (tx, _rx) = mpsc::channel(1);
-        let error = ai::generate(request, CancellationToken::new(), tx)
+        let work = tokio::spawn(ai::generate(request, CancellationToken::new(), tx));
+        let pid: i32 = wait_runtime_record(root.path(), "pid")
             .await
-            .unwrap_err();
+            .parse()
+            .unwrap();
+        let error = work.await.unwrap().unwrap_err();
         assert_eq!(error.code, "timeout");
         assert!(!error.termination_unknown, "{error:?}");
-        let pid: i32 = std::fs::read_to_string(record).unwrap().parse().unwrap();
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     }
     #[tokio::test]
@@ -253,6 +397,25 @@ prompt=sys.stdin.read()
         }
     }
     #[tokio::test]
+    async fn terminal_failure_keeps_only_bounded_redacted_stderr_categories() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let body = "os.write(2,b'Permission denied writing /private/SYNTHETIC_SECRET/models_cache.json token=SYNTHETIC_TOKEN\\n')\nprint(json.dumps({'type':'system','subtype':'init','tools':[],'mcp_servers':[],'permissionMode':'dontAsk'}),flush=True)\nprint(json.dumps({'type':'result','subtype':'error_during_execution','is_error':True,'errors':['synthetic failure']}),flush=True)\ntime.sleep(120)";
+        let executable = fake_cli(fixture.path(), body);
+        let (tx, _rx) = mpsc::channel(1);
+        let error = ai::generate(spec(executable, root.path()), CancellationToken::new(), tx)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "cli_failed");
+        assert!(error.message.contains("stdout: event=result"));
+        assert!(error.message.contains("stderr:"));
+        assert!(error.message.contains("component=model_catalog_cache"));
+        assert!(!error.message.contains("SYNTHETIC_"));
+        assert!(!error.message.contains("/private/"));
+        assert!(error.message.len() < 1500);
+    }
+
+    #[tokio::test]
     async fn zero_exit_without_terminal_success_is_rejected() {
         let root = tempfile::tempdir().unwrap();
         let fixture = tempfile::tempdir().unwrap();
@@ -270,11 +433,9 @@ prompt=sys.stdin.read()
     async fn dropping_generation_future_kills_the_process_group() {
         let root = tempfile::tempdir().unwrap();
         let fixture = tempfile::tempdir().unwrap();
-        let record = fixture.path().join("pid");
-        let body = format!(
-            "with open({},'w') as out:\n    out.write(str(os.getpid()))\ntime.sleep(120)",
-            serde_json::to_string(record.to_str().unwrap()).unwrap()
-        );
+
+        let body = "with open('pid','w') as out:\n    out.write(str(os.getpid()))\ntime.sleep(120)"
+            .to_owned();
         let executable = fake_cli(fixture.path(), &body);
         let (tx, _rx) = mpsc::channel(1);
         let work = tokio::spawn(ai::generate(
@@ -282,8 +443,10 @@ prompt=sys.stdin.read()
             CancellationToken::new(),
             tx,
         ));
-        wait_file(&record).await;
-        let pid: i32 = std::fs::read_to_string(record).unwrap().parse().unwrap();
+        let pid: i32 = wait_runtime_record(root.path(), "pid")
+            .await
+            .parse()
+            .unwrap();
         work.abort();
         let _ = work.await;
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -301,6 +464,7 @@ prompt=sys.stdin.read()
 async fn real_installed_clis_return_terminal_response() {
     for backend in [Backend::Claude, Backend::Codex] {
         let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".architalk")).unwrap();
         let (tx, _rx) = mpsc::channel(128);
         let output = ai::generate(
             RunSpec {

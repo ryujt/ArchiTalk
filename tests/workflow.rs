@@ -283,7 +283,7 @@ fn initial_snapshot_does_not_override_user_config_but_explicit_web_settings_do()
     global.ai.backends.claude.model = Some("configured-model".into());
     let app = App::open(root.path(), global.clone()).unwrap();
     assert_eq!(
-        app.settings()["settings"]["ai"]["backends"]["claude"]["model"],
+        app.settings().unwrap()["settings"]["ai"]["backends"]["claude"]["model"],
         "configured-model"
     );
     let mut web = global.clone();
@@ -294,7 +294,7 @@ fn initial_snapshot_does_not_override_user_config_but_explicit_web_settings_do()
     global.ai.backends.claude.model = Some("new-global-model".into());
     let app = App::open(root.path(), global).unwrap();
     assert_eq!(
-        app.settings()["settings"]["ai"]["backends"]["claude"]["model"],
+        app.settings().unwrap()["settings"]["ai"]["backends"]["claude"]["model"],
         "web-override"
     );
 }

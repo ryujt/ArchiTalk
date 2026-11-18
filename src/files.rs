@@ -71,6 +71,10 @@ impl Directory {
             .context("project_locked: another ArchiTalk process owns this project inode")?;
         Ok(())
     }
+    pub(crate) fn unlock(&self) -> Result<()> {
+        fs2::FileExt::unlock(&self.file)?;
+        Ok(())
+    }
     fn name(name: &str) -> Result<CString> {
         if name.is_empty() || name == ".." || name.contains('/') || name.contains('\\') {
             bail!("unsafe child filename");
@@ -132,6 +136,48 @@ impl Directory {
             device: m.dev(),
             inode: m.ino(),
         })
+    }
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+    /// Remove an owned scratch subtree through directory descriptors only.
+    /// A replaced top-level name is preserved, and symlinks are unlinked rather
+    /// than followed. Callers also verify their pinned ancestor identities.
+    pub(crate) fn remove_private_tree(
+        &self,
+        name: &str,
+        identity: &DirectoryIdentity,
+    ) -> Result<()> {
+        let child = self.open_dir(name)?;
+        if &child.identity()? != identity {
+            bail!("scratch directory identity changed");
+        }
+        for entry in child.names()? {
+            match child.open_dir(&entry) {
+                Ok(directory) => child.remove_private_tree(&entry, &directory.identity()?)?,
+                Err(error)
+                    if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                        matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))
+                    }) =>
+                {
+                    let entry = Self::name(&entry)?;
+                    if unsafe { libc::unlinkat(child.file.as_raw_fd(), entry.as_ptr(), 0) } != 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if &self.open_dir(name)?.identity()? != identity {
+            bail!("scratch directory identity changed during cleanup");
+        }
+        let name = Self::name(name)?;
+        if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.sync()?;
+        Ok(())
     }
     pub(crate) fn make_private(&self) -> Result<()> {
         let metadata = self.file.metadata()?;

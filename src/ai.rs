@@ -1,5 +1,7 @@
-//! Version-gated, text-only local CLI adapters. No project data or final files are
-//! written here. The controller alone decides whether a terminal result commits.
+//! Version-gated, text-only local CLI adapters. User source and published files
+//! are not modified here. Only private runtime scratch is writable. The controller alone
+//! decides whether a terminal result commits.
+use crate::files::Directory;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -63,10 +65,10 @@ impl Backend {
             Self::Codex => "codex",
         }
     }
-    fn version(self) -> &'static str {
+    fn versions(self) -> &'static [&'static str] {
         match self {
-            Self::Claude => "2.1.326",
-            Self::Codex => "0.169.0",
+            Self::Claude => &["2.1.326", "2.1.327"],
+            Self::Codex => &["0.169.0"],
         }
     }
     fn efforts(self) -> Vec<String> {
@@ -156,6 +158,111 @@ impl AiError {
         }
     }
 }
+/// Return fixed vocabulary only: never copy stderr, paths, prompts or secrets
+/// into logs/UI. The retained input is already bounded by STDERR_RETAIN.
+fn failure_summary(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes).to_lowercase();
+    let has = |markers: &[&str]| markers.iter().any(|marker| text.contains(marker));
+    let reason = if text.is_empty() {
+        "none"
+    } else if has(&[
+        "operation not permitted",
+        "permission denied",
+        "os error 1)",
+        "os error 13)",
+        "readonly database",
+        "read-only file system",
+    ]) {
+        "permission_denied"
+    } else if has(&[
+        "unauthorized",
+        "not logged in",
+        "login required",
+        "token expired",
+        "refresh token",
+        "invalid api key",
+        "401",
+    ]) {
+        "authentication"
+    } else if has(&[
+        "unexpected argument",
+        "unrecognized",
+        "invalid value",
+        "unknown field",
+        "error loading configuration",
+        "invalid configuration",
+    ]) {
+        "configuration"
+    } else if has(&[
+        "connection refused",
+        "network is unreachable",
+        "failed to connect",
+        "dns",
+        "request failed",
+        "connection failed",
+    ]) {
+        "network"
+    } else if has(&["no prompt provided", "prompt cannot be empty"]) {
+        "empty_input"
+    } else if has(&["failed to create", "no such file", "i/o error"]) {
+        "startup_io"
+    } else {
+        "unclassified"
+    };
+    let component = if has(&[
+        "models_cache",
+        "model catalog",
+        "models-manager",
+        "models_manager",
+    ]) {
+        "model_catalog_cache"
+    } else if has(&["arg0", "path aliases"]) {
+        "path_alias_cache"
+    } else if has(&["skills"]) {
+        "skills_cache"
+    } else if has(&["sqlite", "database"]) {
+        "database"
+    } else if has(&["history", "rollout", "session index", "session_index"]) {
+        "session_history"
+    } else if has(&["log_dir", "logs_", "log file", "logging"]) {
+        "logs"
+    } else if has(&["auth.json", "credentials", "refresh token"]) {
+        "authentication"
+    } else if has(&["config.toml", "configuration"]) {
+        "configuration"
+    } else {
+        "unknown"
+    };
+    format!("reason={reason}, component={component}")
+}
+
+fn failure_line_summaries(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut summaries = Vec::new();
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        let severity = if lower.contains("warn") {
+            "warning"
+        } else if lower.contains("error") {
+            "error"
+        } else {
+            "notice"
+        };
+        let summary = format!("level={severity}, {}", failure_summary(line.as_bytes()));
+        if !summaries.contains(&summary) {
+            summaries.push(summary);
+        }
+        if summaries.len() == 8 {
+            break;
+        }
+    }
+    if summaries.is_empty() {
+        failure_summary(bytes)
+    } else {
+        summaries.join("; ")
+    }
+}
+
 fn io_error(error: std::io::Error) -> AiError {
     AiError::new("cli_io_error", format!("AI CLI I/O failed: {error}"))
 }
@@ -163,6 +270,16 @@ fn io_error(error: std::io::Error) -> AiError {
 /// This command never invokes a model or changes login state. Capability and
 /// parser profiles are deliberately pinned; help does not prove authentication.
 pub async fn diagnose(backend: Backend, executable: &str) -> Diagnostic {
+    diagnose_at(backend, executable, None).await
+}
+
+/// Project-aware preparation never puts a project prompt or CLI runtime in a
+/// shared temporary directory. Authentication remains read-only in its normal home.
+pub async fn diagnose_in_project(backend: Backend, executable: &str, project: &Path) -> Diagnostic {
+    diagnose_at(backend, executable, Some(project)).await
+}
+
+async fn diagnose_at(backend: Backend, executable: &str, project: Option<&Path>) -> Diagnostic {
     let mut diagnostic = Diagnostic {
         backend,
         available: false,
@@ -181,7 +298,7 @@ pub async fn diagnose(backend: Backend, executable: &str) -> Diagnostic {
         }
     };
     diagnostic.available = true;
-    let temp = match private_run_dir() {
+    let temp = match RunDirectory::create(project) {
         Ok(temp) => temp,
         Err(error) => {
             diagnostic.termination_unknown = error.termination_unknown;
@@ -189,7 +306,7 @@ pub async fn diagnose(backend: Backend, executable: &str) -> Diagnostic {
             return diagnostic;
         }
     };
-    let version = match capture_info(&path, &["--version"], temp.path()).await {
+    let version = match capture_info(&path, &["--version"], &temp, backend).await {
         Ok(version) => version,
         Err(error) => {
             diagnostic.termination_unknown = error.termination_unknown;
@@ -197,15 +314,21 @@ pub async fn diagnose(backend: Backend, executable: &str) -> Diagnostic {
             return diagnostic;
         }
     };
-    let expected = match backend {
-        Backend::Claude => format!("{} (Claude Code)", backend.version()),
-        Backend::Codex => format!("codex-cli {}", backend.version()),
-    };
-    diagnostic.version = Some(version.trim().to_owned());
-    if version.trim() != expected {
+    let observed = version.trim();
+    diagnostic.version = Some(observed.to_owned());
+    let supported = backend.versions().iter().any(|version| {
+        observed
+            == match backend {
+                Backend::Claude => format!("{version} (Claude Code)"),
+                Backend::Codex => format!("codex-cli {version}"),
+            }
+    });
+    if !supported {
+        let observed: String = observed.chars().take(256).collect();
         diagnostic.message = format!(
-            "Unverified {backend} version. Supported profile: {}. No model was called.",
-            backend.version()
+            "Unverified {backend} version {observed:?} at {}. Supported profiles: {}. No model was called.",
+            path.display(),
+            backend.versions().join(", ")
         );
         return diagnostic;
     }
@@ -213,7 +336,7 @@ pub async fn diagnose(backend: Backend, executable: &str) -> Diagnostic {
         Backend::Claude => &["--help"],
         Backend::Codex => &["exec", "--help"],
     };
-    let help = match capture_info(&path, args, temp.path()).await {
+    let help = match capture_info(&path, args, &temp, backend).await {
         Ok(help) => help,
         Err(error) => {
             diagnostic.termination_unknown = error.termination_unknown;
@@ -263,8 +386,9 @@ pub async fn diagnose(backend: Backend, executable: &str) -> Diagnostic {
     }
     diagnostic.compatible = true;
     diagnostic.message = format!(
-        "Verified {backend} {} option/parser profile; project writes are OS-denied during generation. Login and per-model effort support require a requested model call. Named Codex profiles are not supported.",
-        backend.version()
+        "Verified {backend} {} option/parser profile at {}; project writes are OS-denied during generation. Login and per-model effort support require a requested model call. Named Codex profiles are not supported.",
+        observed,
+        path.display()
     );
     diagnostic
 }
@@ -475,6 +599,233 @@ fn private_run_dir() -> Result<tempfile::TempDir, AiError> {
     }
     Ok(temp)
 }
+fn runtime_error(error: impl std::fmt::Display) -> AiError {
+    AiError::new(
+        "restricted_execution_unavailable",
+        format!("Private project runtime is unavailable: {error}. No model was called."),
+    )
+}
+
+struct OwnedRunDirectory {
+    project: PathBuf,
+    path: PathBuf,
+    name: String,
+    root: Directory,
+    state: Directory,
+    runtime: Directory,
+    run: Directory,
+}
+impl OwnedRunDirectory {
+    fn create(project: &Path) -> Result<Self, AiError> {
+        let project = project.canonicalize().map_err(io_error)?;
+        let root = Directory::root(&project).map_err(runtime_error)?;
+        let ensure = |parent: &Directory, name: &str| -> Result<Directory, AiError> {
+            match parent.mkdir(name, 0o700) {
+                Ok(()) => {}
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) => {
+                }
+                Err(error) => return Err(runtime_error(error)),
+            }
+            let directory = parent.open_dir(name).map_err(runtime_error)?;
+            directory.make_private().map_err(runtime_error)?;
+            Ok(directory)
+        };
+        // Store owns state creation. A deleted workspace must never be revived
+        // by a delayed diagnostic or generation task.
+        let state = root.open_dir(".architalk").map_err(runtime_error)?;
+        state.make_private().map_err(runtime_error)?;
+        let runtime = ensure(&state, "runtime")?;
+        let name = format!("run-{}", uuid::Uuid::new_v4());
+        runtime.mkdir(&name, 0o700).map_err(runtime_error)?;
+        let run = runtime.open_dir(&name).map_err(runtime_error)?;
+        run.make_private().map_err(runtime_error)?;
+        let path = project.join(".architalk/runtime").join(&name);
+        let owned = Self {
+            project,
+            path,
+            name,
+            root,
+            state,
+            runtime,
+            run,
+        };
+        owned.validate()?;
+        for directory in ["tmp", "codex-state", "log", "cache", "codex-home"] {
+            owned.run.mkdir(directory, 0o700).map_err(runtime_error)?;
+        }
+        Ok(owned)
+    }
+    fn validate(&self) -> Result<(), AiError> {
+        let root = Directory::root(&self.project).map_err(runtime_error)?;
+        let state = root.open_dir(".architalk").map_err(runtime_error)?;
+        let runtime = state.open_dir("runtime").map_err(runtime_error)?;
+        let run = runtime.open_dir(&self.name).map_err(runtime_error)?;
+        for (actual, expected) in [
+            (&root, &self.root),
+            (&state, &self.state),
+            (&runtime, &self.runtime),
+            (&run, &self.run),
+        ] {
+            if actual.identity().map_err(runtime_error)?
+                != expected.identity().map_err(runtime_error)?
+            {
+                return Err(runtime_error("directory identity changed"));
+            }
+        }
+        Ok(())
+    }
+    fn link_codex_auth(&self, shared_home: &Path) -> Result<bool, AiError> {
+        use std::{
+            ffi::CString,
+            os::unix::{
+                ffi::OsStrExt,
+                fs::{MetadataExt, PermissionsExt},
+            },
+        };
+        self.validate()?;
+        let shared_home = match shared_home.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(runtime_error(error)),
+        };
+        let shared = Directory::root(&shared_home).map_err(runtime_error)?;
+        let auth = match shared.open_file("auth.json", false) {
+            Ok(file) => file,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(false);
+            }
+            Err(_) => {
+                return Err(runtime_error(
+                    "shared Codex authentication must be a regular, non-symlink file",
+                ));
+            }
+        };
+        let metadata = auth.metadata().map_err(io_error)?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+            || metadata.len() == 0
+            || metadata.len() > FRAME_LIMIT as u64
+        {
+            return Err(runtime_error(
+                "shared Codex authentication ownership, permissions or size is unsafe",
+            ));
+        }
+        let target = shared_home.join("auth.json");
+        let local_home = self.run.open_dir("codex-home").map_err(runtime_error)?;
+        let destination = self.path.join("codex-home/auth.json");
+        match std::fs::read_link(&destination) {
+            Ok(existing) if existing == target => return Ok(true),
+            Ok(_) => return Err(runtime_error("private Codex authentication link changed")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(runtime_error(error)),
+        }
+        let target = CString::new(target.as_os_str().as_bytes()).map_err(runtime_error)?;
+        let name = CString::new("auth.json").unwrap();
+        if unsafe { libc::symlinkat(target.as_ptr(), local_home.raw_fd(), name.as_ptr()) } != 0 {
+            return Err(runtime_error(std::io::Error::last_os_error()));
+        }
+        Ok(true)
+    }
+
+    fn write_private(&self, name: &str, content: &[u8]) -> Result<(), AiError> {
+        use std::io::Write;
+        self.validate()?;
+        let mut file = self.run.create_private_file(name).map_err(runtime_error)?;
+        file.write_all(content).map_err(io_error)?;
+        Ok(())
+    }
+}
+impl Drop for OwnedRunDirectory {
+    fn drop(&mut self) {
+        if self.validate().is_ok() {
+            if let Ok(identity) = self.run.identity() {
+                if self
+                    .runtime
+                    .remove_private_tree(&self.name, &identity)
+                    .is_err()
+                {
+                    tracing::warn!(
+                        phase = "runtime_cleanup",
+                        "Private run cleanup failed; original retained"
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                phase = "runtime_cleanup",
+                "Private run directory identity changed; retained without external cleanup"
+            );
+        }
+    }
+}
+
+enum RunDirectory {
+    Generic(tempfile::TempDir),
+    Project(OwnedRunDirectory),
+}
+impl RunDirectory {
+    fn create(project: Option<&Path>) -> Result<Self, AiError> {
+        match project {
+            Some(project) => OwnedRunDirectory::create(project).map(Self::Project),
+            None => private_run_dir().map(Self::Generic),
+        }
+    }
+    fn path(&self) -> &Path {
+        match self {
+            Self::Generic(temp) => temp.path(),
+            Self::Project(run) => &run.path,
+        }
+    }
+    fn configure_codex_home(&self, command: &mut Command) -> Result<(), AiError> {
+        if let Self::Project(run) = self {
+            let shared_home = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"))
+                });
+            if let Some(shared_home) = shared_home {
+                run.link_codex_auth(&shared_home)?;
+            }
+            command.env("CODEX_HOME", run.path.join("codex-home"));
+        }
+        Ok(())
+    }
+
+    fn command(&self, executable: impl AsRef<std::ffi::OsStr>) -> Result<Command, AiError> {
+        let mut command = base_command(executable, self.path());
+        if let Self::Project(run) = self {
+            run.validate()?;
+            let fd = run.run.raw_fd();
+            // The handle outlives the child and makes cwd independent of path swaps.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fchdir(fd) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+            command.env("TMPDIR", run.path.join("tmp"));
+            command.env("CLAUDE_CODE_TMPDIR", run.path.join("tmp"));
+            command.env("CODEX_SQLITE_HOME", run.path.join("codex-state"));
+            command.env("XDG_CACHE_HOME", run.path.join("cache"));
+        }
+        command.env("CLAUDE_CODE_SAFE_MODE", "1");
+        command.env("DISABLE_AUTOUPDATER", "1");
+        command.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+        Ok(command)
+    }
+}
+
 fn base_command(executable: impl AsRef<std::ffi::OsStr>, cwd: &Path) -> Command {
     let mut command = Command::new(executable);
     command
@@ -586,11 +937,32 @@ async fn stop_group(child: &mut Child, guard: &mut GroupGuard) -> bool {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
-async fn capture_info(executable: &Path, args: &[&str], cwd: &Path) -> Result<String, AiError> {
-    let mut child = base_command(executable, cwd)
-        .args(args)
-        .spawn()
-        .map_err(io_error)?;
+async fn capture_info(
+    executable: &Path,
+    args: &[&str],
+    run: &RunDirectory,
+    backend: Backend,
+) -> Result<String, AiError> {
+    let mut command = if matches!(run, RunDirectory::Project(_)) {
+        let profile = sandbox_profile(run.path())?;
+        if let RunDirectory::Project(owned) = run {
+            if !run.path().join("diagnostic.sb").exists() {
+                owned.write_private("diagnostic.sb", profile.as_bytes())?;
+            }
+        }
+        let mut command = run.command("/usr/bin/sandbox-exec")?;
+        command
+            .arg("-f")
+            .arg(run.path().join("diagnostic.sb"))
+            .arg(executable);
+        command
+    } else {
+        run.command(executable)?
+    };
+    if backend == Backend::Codex {
+        run.configure_codex_home(&mut command)?;
+    }
+    let mut child = command.args(args).spawn().map_err(io_error)?;
     let mut guard = GroupGuard {
         pid: child
             .id()
@@ -751,6 +1123,8 @@ fn cli_args(spec: &RunSpec) -> Vec<String> {
             "web_search=\"disabled\"",
             "-c",
             "developer_instructions=\"\"",
+            "-c",
+            "cli_auth_credentials_store=\"file\"",
         ]
         .iter()
         .map(|s| (*s).to_owned())
@@ -778,11 +1152,11 @@ fn cli_args(spec: &RunSpec) -> Vec<String> {
     }
     args
 }
-fn sandbox_profile(project: &Path) -> Result<String, AiError> {
-    let path = project.to_str().ok_or_else(|| {
+fn sandbox_profile(runtime: &Path) -> Result<String, AiError> {
+    let path = runtime.to_str().ok_or_else(|| {
         AiError::new(
             "restricted_execution_unavailable",
-            "Project root must be valid UTF-8 for OS sandboxing.",
+            "Runtime path must be valid UTF-8 for OS sandboxing.",
         )
     })?;
     // JSON string escaping matches Seatbelt quoted-path escaping for these
@@ -790,7 +1164,7 @@ fn sandbox_profile(project: &Path) -> Result<String, AiError> {
     if path.chars().any(char::is_control) {
         return Err(AiError::new(
             "restricted_execution_unavailable",
-            "Project path contains unsupported control characters.",
+            "Runtime path contains unsupported control characters.",
         ));
     }
     let escaped = serde_json::to_string(path).map_err(|_| {
@@ -800,7 +1174,7 @@ fn sandbox_profile(project: &Path) -> Result<String, AiError> {
         )
     })?;
     Ok(format!(
-        "(version 1)\n(allow default)\n(deny file-write* (subpath {escaped}))\n"
+        "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (subpath {escaped}) (literal \"/dev/null\"))\n"
     ))
 }
 
@@ -819,7 +1193,7 @@ pub async fn generate(
             "Generation was cancelled before starting.",
         ));
     }
-    let diagnostic = diagnose(spec.backend, &spec.executable).await;
+    let diagnostic = diagnose_in_project(spec.backend, &spec.executable, &spec.project_root).await;
     if !diagnostic.compatible {
         return Err(diagnostic_failure(diagnostic));
     }
@@ -836,26 +1210,40 @@ pub async fn generate(
             "Project root is not a directory.",
         ));
     }
-    let run = private_run_dir()?;
-    let cwd = run.path().canonicalize().map_err(io_error)?;
-    if cwd.starts_with(&project) {
-        return Err(AiError::new(
-            "restricted_execution_unavailable",
-            "AI run directory must be outside the project root.",
-        ));
+    let run = RunDirectory::create(Some(&project))?;
+    let cwd = run.path();
+    let profile_path = cwd.join("runtime-write-only.sb");
+    if let RunDirectory::Project(owned) = &run {
+        owned.write_private("runtime-write-only.sb", sandbox_profile(cwd)?.as_bytes())?;
     }
-    let profile_path = cwd.join("project-write-deny.sb");
-    std::fs::write(&profile_path, sandbox_profile(&project)?).map_err(io_error)?;
-    // Probe the exact profile before launching a model process. This direct touch
-    // must fail and cannot create any project file under a valid profile.
-    verify_write_denial(&cwd, &profile_path, &project).await?;
+    verify_write_denial(&run, &profile_path, &project).await?;
     let executable = executable_path(&spec.executable)?;
-    let mut command = base_command("/usr/bin/sandbox-exec", &cwd);
+    let mut command = run.command("/usr/bin/sandbox-exec")?;
+    let mut args = cli_args(&spec);
+    if spec.backend == Backend::Codex {
+        args.pop();
+    }
     command
         .arg("-f")
         .arg(&profile_path)
         .arg(executable)
-        .args(cli_args(&spec));
+        .args(args);
+    if spec.backend == Backend::Codex {
+        run.configure_codex_home(&mut command)?;
+        for (key, value) in [
+            ("sqlite_home", cwd.join("codex-state")),
+            ("log_dir", cwd.join("log")),
+        ] {
+            command.arg("-c").arg(format!(
+                "{key}={}",
+                serde_json::to_string(&value.to_string_lossy()).map_err(runtime_error)?
+            ));
+        }
+        command
+            .arg("-c")
+            .arg("history.persistence=\"none\"")
+            .arg("-");
+    }
     let mut child = command.spawn().map_err(io_error)?;
     let mut guard = GroupGuard {
         pid: child
@@ -936,7 +1324,19 @@ pub async fn generate(
         drains_clean &= cleanup_task(&mut stdout).await;
     }
     if !stderr_done {
-        drains_clean &= cleanup_task(&mut stderr).await;
+        match tokio::time::timeout(GRACE, &mut stderr).await {
+            Ok(result) => match task_result(result) {
+                Ok(bytes) => retained = Some(bytes),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            },
+            Err(_) => {
+                stderr.abort();
+                let _ = stderr.await;
+                drains_clean = false;
+            }
+        }
     }
     if !write_done {
         drains_clean &= cleanup_task(&mut writer).await;
@@ -962,7 +1362,11 @@ pub async fn generate(
         );
         return Err(error);
     }
-    if let Some(error) = failure {
+    if let Some(mut error) = failure {
+        error.message.push_str(&format!(
+            " [stderr: {}]",
+            failure_line_summaries(retained.as_deref().unwrap_or_default())
+        ));
         return Err(error);
     }
     if !status.unwrap().success() {
@@ -987,7 +1391,7 @@ pub async fn generate(
                 "AI CLI authentication failed. Use the installed CLI's official login command in your terminal, then explicitly retry."
             } else {
                 "AI CLI exited unsuccessfully. Inspect the installed CLI in your terminal and explicitly retry; no automatic retry was made."
-            },
+            }.to_owned() + &format!(" [stderr: {}; exit={:?}]", failure_line_summaries(retained.as_deref().unwrap_or_default()), status.unwrap().code()),
         ));
     }
     let parsed = parsed.unwrap();
@@ -1010,9 +1414,14 @@ async fn cleanup_task<T>(task: &mut JoinHandle<T>) -> bool {
         false
     }
 }
-async fn verify_write_denial(cwd: &Path, profile: &Path, project: &Path) -> Result<(), AiError> {
+async fn verify_write_denial(
+    run: &RunDirectory,
+    profile: &Path,
+    project: &Path,
+) -> Result<(), AiError> {
     let target = project.join(format!(".architalk-denied-probe-{}", uuid::Uuid::new_v4()));
-    let mut child = base_command("/usr/bin/sandbox-exec", cwd)
+    let mut child = run
+        .command("/usr/bin/sandbox-exec")?
         .arg("-f")
         .arg(profile)
         .arg("/usr/bin/touch")
@@ -1170,6 +1579,16 @@ impl Parsed {
     }
     fn terminal_failure(event: &Value) -> AiError {
         let message = event.to_string().to_lowercase();
+        let kind = match event["type"].as_str() {
+            Some("turn.failed") => "turn.failed",
+            Some("result") => "result",
+            Some("error") => "error",
+            _ => "unknown",
+        };
+        let summary = format!(
+            " [stdout: event={kind}, {}]",
+            failure_summary(message.as_bytes())
+        );
         if [
             "unauthorized",
             "authentication",
@@ -1186,12 +1605,12 @@ impl Parsed {
         {
             AiError::new(
                 "authentication_required",
-                "AI CLI authentication failed. Use the installed CLI's official login procedure in your terminal, then explicitly retry.",
+                "AI CLI authentication failed. Use the installed CLI's official login procedure in your terminal, then explicitly retry.".to_owned() + &summary,
             )
         } else {
             AiError::new(
                 "cli_failed",
-                "AI CLI reported a failed result. Check CLI authentication/model settings in your terminal and explicitly retry.",
+                "AI CLI reported a failed result. Check CLI authentication/model settings in your terminal and explicitly retry.".to_owned() + &summary,
             )
         }
     }
@@ -1383,7 +1802,13 @@ impl Parsed {
                                 message: "Codex가 답변을 생성하고 있어요.".to_owned(),
                             }))
                         } else {
-                            Err(AiError::new("cli_failed", "Codex reported an item error."))
+                            Err(AiError::new(
+                                "cli_failed",
+                                format!(
+                                    "Codex reported an item error. [stdout: event=item.error, {}]",
+                                    failure_summary(message.as_bytes())
+                                ),
+                            ))
                         }
                     }
                     Some(_) => Err(AiError::new(
@@ -1650,6 +2075,228 @@ mod tests {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "installed Codex startup diagnostic; no prompt and OS network denied, no model request"]
+    async fn installed_codex_empty_input_startup_without_network() {
+        installed_codex_startup_probe(false, false).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "installed Codex startup diagnostic; synthetic input and OS network denied, no model request"]
+    async fn installed_codex_synthetic_startup_without_network() {
+        installed_codex_startup_probe(true, false).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "installed Codex local-home startup diagnostic; OS IP network denied, no model request"]
+    async fn installed_codex_private_home_startup_without_network() {
+        installed_codex_startup_probe(true, true).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn installed_codex_startup_probe(with_prompt: bool, private_home: bool) {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".architalk")).unwrap();
+        let run = RunDirectory::create(Some(project.path())).unwrap();
+        let profile = sandbox_profile(run.path()).unwrap()
+            + "\n(deny network*)\n(allow network-bind (local unix-socket))\n(allow network-outbound (remote unix-socket))\n";
+        if let RunDirectory::Project(owned) = &run {
+            owned
+                .write_private("no-network.sb", profile.as_bytes())
+                .unwrap();
+        }
+        let spec = RunSpec {
+            backend: Backend::Codex,
+            executable: "codex".into(),
+            model: None,
+            effort: Some("low".into()),
+            profile: None,
+            timeout_seconds: 20,
+            prompt: String::new(),
+            project_root: project.path().into(),
+        };
+        let mut args = cli_args(&spec);
+        args.pop();
+        for (key, value) in [
+            ("sqlite_home", run.path().join("codex-state")),
+            ("log_dir", run.path().join("log")),
+        ] {
+            args.extend([
+                "-c".to_owned(),
+                format!(
+                    "{key}={}",
+                    serde_json::to_string(&value.to_string_lossy()).unwrap()
+                ),
+            ]);
+        }
+        args.extend([
+            "-c".into(),
+            "history.persistence=\"none\"".into(),
+            "-".into(),
+        ]);
+        let mut command = run.command("/usr/bin/sandbox-exec").unwrap();
+        if private_home {
+            run.configure_codex_home(&mut command).unwrap();
+        }
+        let mut child = command
+            .arg("-f")
+            .arg(run.path().join("no-network.sb"))
+            .arg(executable_path("codex").unwrap())
+            .args(args)
+            .stdin(if with_prompt {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .spawn()
+            .unwrap();
+        if with_prompt {
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(b"Return ONLY the exact JSON object {\"ok\":true}. Synthetic startup probe; do not use tools.").await.unwrap();
+            drop(stdin);
+        }
+        let mut guard = GroupGuard {
+            pid: child.id().unwrap(),
+            armed: true,
+        };
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let out_task = tokio::spawn(read_small(stdout, STDERR_RETAIN));
+        let err_task = tokio::spawn(read_small(stderr, STDERR_RETAIN));
+        let output = tokio::time::timeout(Duration::from_secs(20), child.wait()).await;
+        let timed_out = output.is_err();
+        assert!(
+            stop_group(&mut child, &mut guard).await,
+            "startup probe process must stop"
+        );
+        let out = tokio::time::timeout(GRACE, out_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let err = tokio::time::timeout(GRACE, err_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let status = if let Ok(status) = output {
+            status.unwrap()
+        } else {
+            child.try_wait().unwrap().unwrap()
+        };
+        let events = String::from_utf8_lossy(&out)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .map(|event| match event["type"].as_str() {
+                Some("thread.started") => "thread.started",
+                Some("turn.started") => "turn.started",
+                Some("error") => "error",
+                Some("turn.failed") => "turn.failed",
+                _ => "other",
+            })
+            .collect::<Vec<_>>();
+        let stdout_failures = String::from_utf8_lossy(&out)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| matches!(event["type"].as_str(), Some("error" | "turn.failed")))
+            .map(|event| failure_summary(event.to_string().as_bytes()))
+            .collect::<Vec<_>>();
+        println!(
+            "Codex no-network startup with_prompt={with_prompt}, private_home={private_home}, stopped_at_timeout={timed_out}: exit={:?}; {}; events={events:?}; terminal_categories={stdout_failures:?}",
+            status.code(),
+            failure_line_summaries(&err)
+        );
+        assert!(
+            !status.success(),
+            "no-network diagnostic must not produce a successful model result"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn private_codex_home_reads_auth_pointer_without_copy_or_shared_write() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".architalk")).unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let auth = shared.path().join("auth.json");
+        std::fs::write(&auth, b"synthetic credential fixture").unwrap();
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let run = RunDirectory::create(Some(project.path())).unwrap();
+        let local_home = run.path().join("codex-home");
+        if let RunDirectory::Project(owned) = &run {
+            assert!(owned.link_codex_auth(shared.path()).unwrap());
+        }
+        assert!(
+            std::fs::symlink_metadata(local_home.join("auth.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let profile = sandbox_profile(run.path()).unwrap();
+        if let RunDirectory::Project(owned) = &run {
+            owned
+                .write_private("auth-pointer.sb", profile.as_bytes())
+                .unwrap();
+        }
+        let code = "import os,json\np=os.path.join(os.environ['CODEX_HOME'],'auth.json')\nread_ok=open(p).read()=='synthetic credential fixture'\nblocked=False\ntry:\n open(p,'w').write('forbidden')\nexcept PermissionError:\n blocked=True\nprint(json.dumps({'read_ok':read_ok,'shared_write_blocked':blocked}))";
+        let out = run
+            .command("/usr/bin/sandbox-exec")
+            .unwrap()
+            .arg("-f")
+            .arg(run.path().join("auth-pointer.sb"))
+            .arg("/usr/bin/python3")
+            .args(["-c", code])
+            .env("CODEX_HOME", &local_home)
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+            serde_json::json!({"read_ok":true,"shared_write_blocked":true})
+        );
+        drop(run);
+        assert!(!local_home.exists());
+        assert_eq!(
+            std::fs::read(&auth).unwrap(),
+            b"synthetic credential fixture"
+        );
+        std::fs::remove_file(&auth).unwrap();
+        symlink(shared.path().join("other-auth"), &auth).unwrap();
+        let run = OwnedRunDirectory::create(project.path()).unwrap();
+        assert!(
+            run.link_codex_auth(shared.path()).is_err(),
+            "shared credential symlinks must be refused"
+        );
+    }
+
+    #[test]
+    fn failure_diagnostics_never_echo_paths_prompts_or_credentials() {
+        let raw = b"Permission denied writing /private/SYNTHETIC_SECRET/.codex/models_cache.json with token=SYNTHETIC_TOKEN prompt=SYNTHETIC_PROMPT";
+        let summary = failure_summary(raw);
+        assert_eq!(
+            summary,
+            "reason=permission_denied, component=model_catalog_cache"
+        );
+        for forbidden in [
+            "SYNTHETIC_SECRET",
+            "SYNTHETIC_TOKEN",
+            "SYNTHETIC_PROMPT",
+            "/private/",
+        ] {
+            assert!(!summary.contains(forbidden));
+        }
+        let error = Parsed::terminal_failure(
+            &serde_json::json!({"type":"turn.failed","error":{"message":String::from_utf8_lossy(raw)}}),
+        );
+        assert!(error.message.contains("stdout: event=turn.failed"));
+        assert!(!error.message.contains("SYNTHETIC_"));
+    }
+
     #[test]
     fn sandbox_profile_escapes_quoted_paths_and_rejects_controls() {
         let profile = sandbox_profile(Path::new("/tmp/project \"quoted\"\\name")).unwrap();

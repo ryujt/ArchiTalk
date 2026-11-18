@@ -23,6 +23,9 @@ test('capability fragment is removed before storage or requests, with in-memory 
   assert.equal(order[0][0],'replace');
   assert.equal(order[0][3],'/?view=local');
   assert.equal(takeToken({hash:'#token=memory',pathname:'/',search:''},{replaceState(){}},{setItem(){throw new Error('disabled');}}),'memory');
+  const expired=new Map([['architalk.authorization','old']]);
+  assert.equal(takeToken({hash:'#token=',pathname:'/',search:''},{replaceState(){}},{getItem:key=>expired.get(key),removeItem:key=>expired.delete(key)}),'');
+  assert.equal(expired.has('architalk.authorization'),false);
   assert.equal(takeToken({hash:'',pathname:'/',search:''},{replaceState(){assert.fail('no token to remove');}},{getItem(){return 'remembered';}}),'remembered');
 });
 
@@ -142,20 +145,21 @@ class Element {
   closest(){return this;}
   matches(){return false;}
 }
-function harness(fixture){
-  const elements=new Map(),listeners=new Map(),winListeners=new Map(),requests=[],streams=[];
+function harness(fixture,{storageEntries=[]}={}){
+  const elements=new Map(),listeners=new Map(),winListeners=new Map(),requests=[],streams=[],reloads=[];
   const doc={activeElement:null,body:{classList:{toggle(){return true;}}},getElementById(id){if(!elements.has(id))elements.set(id,new Element(id,doc));return elements.get(id);},addEventListener(name,fn){listeners.set(name,fn);}};
-  const storage=new Map();
-  const win={location:{hash:'#token=private-test-capability',pathname:'/',search:''},history:{replaceState(){}},sessionStorage:{setItem(k,v){storage.set(k,v);},getItem(k){return storage.get(k)||null;},removeItem(k){storage.delete(k);}},crypto:webcrypto,setTimeout,clearTimeout,addEventListener(name,fn){winListeners.set(name,fn);},fetch:async(path,options)=>{
+  const storage=new Map(storageEntries);
+  const win={location:{hash:'#token=private-test-capability',pathname:'/',search:'',reload(){reloads.push(true);}},history:{replaceState(){}},sessionStorage:{setItem(k,v){storage.set(k,v);},getItem(k){return storage.get(k)||null;},removeItem(k){storage.delete(k);}},crypto:webcrypto,setTimeout,clearTimeout,addEventListener(name,fn){winListeners.set(name,fn);},fetch:async(path,options)=>{
     requests.push({path,options,body:options.body?JSON.parse(options.body):null});
     if(path.includes('/events'))return new Response(new ReadableStream({start(controller){streams.push(controller);}}),{headers:{'content-type':'text/event-stream'}});
     const body=await fixture(path,options,options.body?JSON.parse(options.body):null);
+    if(body instanceof Response)return body;
     return new Response(JSON.stringify(body),{headers:{'content-type':'application/json'}});
   }};
   const app=startWorkspace(doc,win);
   const emit=(name,target)=>listeners.get(name)?.({target,preventDefault(){}});
   const click=(action,data={})=>{const el=new Element('button',doc);el.dataset={action,...data};emit('click',el);};
-  return {app,doc,win,requests,streams,emit,click,dispose(){winListeners.get('pagehide')?.();}};
+  return {app,doc,win,requests,streams,reloads,emit,emitWindow:name=>winListeners.get(name)?.(),click,dispose(){winListeners.get('pagehide')?.();}};
 }
 async function eventually(predicate){for(let n=0;n<100;n++){if(predicate())return;await new Promise(resolve=>setTimeout(resolve,5));}assert.fail('expected UI state was not reached');}
 function sessionFixture(){return {id:'session-1',title:'실제 프로젝트',revision:4,design_revision:2,messages:[{id:'m1',role:'user',content:'<img src=x onerror=alert(1)>',created_at:'2026-11-17T11:00:00Z'},{id:'m2',role:'assistant',content:'실제 CLI에서 확정된 질문',created_at:'2026-11-17T11:00:01Z'}],drafts:[],claims:[],coverage:[],requirements:[],decisions:[],findings:[],questions:[],content_status:'draft',active_run_id:null,cursor:7};}
@@ -413,5 +417,92 @@ test('completion between session and run GETs cannot leave a finished draft in t
     await eventually(()=>h.app.state.scene==='generating'&&!h.app.state.busy);
     finishOnRead=true;await h.app.refresh({keep:true});await h.app.refresh({keep:true});
     assert.equal(h.app.state.scene,'review');assert.match(h.doc.getElementById('workspace-content').innerHTML,/draft-picker/);
+  }finally{h.dispose();}
+});
+
+
+test('authoritative empty workspace drops the previous project view and stream',async()=>{
+  const session=sessionFixture();
+  let workspace={project_name:'before',sessions:[session],runs:[],exports:[],context_files:[],active_run:null};
+  const h=harness(async path=>path==='/api/v1/workspace'?workspace:session);
+  try{
+    await eventually(()=>h.app.state.scene==='recovery');h.click('interview');
+    Object.assign(h.app.state,{settings:{ai:{model:'shared preference'}},selectedDraft:'old-draft',selectedDocument:'decisions',saved:{old:true},lastExport:{old:true},plan:{old:true},live:'old delta',answer:'old answer'});
+    workspace={...workspace,project_name:'fresh',sessions:[],runs:[],exports:[]};
+    await h.app.refresh({keep:true});
+    assert.equal(h.app.state.session,null);assert.equal(h.app.state.run,null);assert.equal(h.app.state.feed,null);
+    for(const field of ['selectedDraft','saved','lastExport','plan'])assert.equal(h.app.state[field],null,field);
+    for(const field of ['live','answer','cursor'])assert.equal(h.app.state[field],'',field);
+    assert.equal(h.app.state.settings.ai.model,'shared preference');
+    assert.equal(h.app.state.selectedDocument,'architecture');assert.equal(h.app.state.scene,'welcome');
+    assert.doesNotMatch(h.doc.getElementById('workspace-content').innerHTML,/실제 CLI에서 확정된 질문/);
+    assert.equal(h.win.sessionStorage.getItem('architalk.session'),null);
+    assert.equal(h.requests.filter(call=>call.options.method!=='GET').length,0);
+  }finally{h.dispose();}
+});
+
+test('terminal reset SSE clears project data and ignores late commands and deltas',async()=>{
+  const session=sessionFixture();let release;
+  const h=harness(async(path,options)=>{
+    if(path==='/api/v1/workspace')return {project_name:'before',sessions:[session],runs:[],exports:[],context_files:[],active_run:null};
+    if(path.endsWith('/draft')&&options.method==='POST')return new Promise(resolve=>{release=()=>resolve({session:{...session,revision:5,drafts:[{id:'late',markdown:'# late draft',input_revision:2}]}});});
+    return session;
+  });
+  try{
+    await eventually(()=>h.app.state.scene==='recovery'&&h.streams.length);h.click('interview');h.click('generate');await eventually(()=>release);
+    h.streams[0].enqueue(encode.encode('event: workspace_reset_required\ndata: {"type":"workspace_reset_required","error":{"code":"workspace_reset_required","message":"합성 초기화"}}\n\nevent: delta\ndata: {"type":"delta","payload":{"text":"late old delta"}}\n\n'));
+    await eventually(()=>h.app.state.connectionBlocked===true);
+    release();await eventually(()=>!h.app.state.busy);
+    assert.equal(h.app.state.workspace,null);assert.equal(h.app.state.session,null);assert.equal(h.app.state.run,null);assert.equal(h.app.state.feed,null);
+    assert.equal(h.app.state.live,'');assert.equal(h.app.state.cursor,'');
+    assert.equal(h.app.state.connection,'disconnected');assert.equal(h.doc.getElementById('connection').lastElementChild.textContent,'새 접속 필요');
+    assert.equal(h.app.state.refreshTimer,null);assert.equal(h.app.state.diagnosticTimer,null);
+    const count=h.requests.length;h.click('generate');h.click('new-session');await h.app.refresh();
+    assert.equal(h.requests.length,count);assert.equal(h.app.state.session,null);
+    const html=h.doc.getElementById('workspace-content').innerHTML;
+    assert.match(html,/서버|새 접속/);assert.doesNotMatch(html,/실제 CLI에서 확정된 질문|late draft|late old delta/);
+    assert.equal(h.win.sessionStorage.getItem('architalk.authorization'),null);
+  }finally{release?.();h.dispose();}
+});
+
+test('last-view selection stays in memory instead of reusing an old browser session ID',async()=>{
+  const first=sessionFixture(),last={...sessionFixture(),id:'session-2',title:'last server session'};
+  const h=harness(async path=>path==='/api/v1/workspace'?{project_name:'project',sessions:[first,last],runs:[],exports:[],context_files:[],active_run:null}:path.endsWith('/session-1')?first:last,{storageEntries:[['architalk.session','session-1']]});
+  try{
+    await eventually(()=>h.app.state.scene==='recovery');assert.equal(h.app.state.session.id,'session-2');
+    assert.equal(h.win.sessionStorage.getItem('architalk.session'),null);
+    h.click('',{session:'session-1'});await eventually(()=>h.app.state.session.id==='session-1'&&!h.app.state.busy);
+    assert.equal(h.win.sessionStorage.getItem('architalk.session'),null);
+    assert.equal(h.win.sessionStorage.getItem('architalk.authorization'),'private-test-capability');
+  }finally{h.dispose();}
+});
+
+test('revoked connection clears old content and stops further refresh requests',async()=>{
+  const session=sessionFixture();let revoked=false;
+  const h=harness(async path=>{
+    if(path==='/api/v1/workspace')return revoked?new Response(JSON.stringify({error:{code:'unauthorized',message:'old capability expired'}}),{status:401}):{project_name:'before',sessions:[session],runs:[],exports:[],context_files:[],active_run:null};
+    return session;
+  });
+  try{
+    await eventually(()=>h.app.state.scene==='recovery');revoked=true;
+    await assert.rejects(h.app.refresh(),error=>error.status===401);
+    assert.equal(h.app.state.connectionBlocked,true);assert.equal(h.app.state.session,null);assert.equal(h.app.state.feed,null);
+    assert.equal(h.win.sessionStorage.getItem('architalk.authorization'),null);
+    const count=h.requests.length;await h.app.refresh();assert.equal(h.requests.length,count);
+    assert.doesNotMatch(h.doc.getElementById('workspace-content').innerHTML,/실제 CLI에서 확정된 질문/);
+  }finally{h.dispose();}
+});
+
+
+test('a new capability fragment reboots the same-origin connection but ordinary anchors do not',async()=>{
+  const session=sessionFixture();
+  const h=harness(async path=>path==='/api/v1/workspace'?{project_name:'before',sessions:[session],runs:[],exports:[],context_files:[],active_run:null}:session);
+  try{
+    await eventually(()=>h.app.state.scene==='recovery');
+    h.win.location.hash='#ordinary-document-anchor';h.emitWindow('hashchange');assert.equal(h.reloads.length,0);assert.equal(h.app.state.session.id,session.id);
+    h.win.location.hash='#token=new-synthetic-capability';h.emitWindow('hashchange');
+    assert.equal(h.reloads.length,1);assert.equal(h.app.state.session,null);assert.equal(h.app.state.feed,null);assert.equal(h.app.state.connectionBlocked,true);
+    assert.equal(h.win.sessionStorage.getItem('architalk.authorization'),null);
+    assert.doesNotMatch(h.doc.getElementById('workspace-content').innerHTML,/실제 CLI에서 확정된 질문/);
   }finally{h.dispose();}
 });

@@ -247,10 +247,7 @@ async fn invalid_design_fails_once_without_paid_repair_and_preserves_prior_draft
     for has_previous in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
-        let script = include_str!("fixtures/claude-workflow.py").replace(
-            "prompt=sys.stdin.read()",
-            "prompt=sys.stdin.read()\nwith Path(__file__).with_name('attempts').open('a') as out: out.write('attempt\\n')",
-        );
+        let script = include_str!("fixtures/claude-workflow.py");
         let executable = external.path().join("fixture.py");
         std::fs::write(&executable, script).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -288,6 +285,7 @@ async fn invalid_design_fails_once_without_paid_repair_and_preserves_prior_draft
             .unwrap();
         drop(store);
         let app = App::open(root.path(), settings).unwrap();
+        let mut events = app.events.subscribe();
         app.command(
             "draft",
             Some(&sid),
@@ -316,10 +314,19 @@ async fn invalid_design_fails_once_without_paid_repair_and_preserves_prior_draft
             workspace["runs"][0]["error"]["code"],
             "invalid_model_output"
         );
+        // Each real fixture generation emits one verified initialization event.
+        // Count it in the parent; the CLI must not write a shared counter file.
+        let mut attempts = 0;
+        while let Ok(event) = events.try_recv() {
+            if event.kind == "progress"
+                && event.payload["message"] == "Claude is generating a response."
+            {
+                attempts += 1;
+            }
+        }
         assert_eq!(
-            std::fs::read_to_string(external.path().join("attempts")).unwrap(),
-            "attempt\n",
-            "one CLI generation attempt"
+            attempts, 1,
+            "one CLI generation attempt without paid repair"
         );
         let session = app.session(&sid).unwrap();
         assert_eq!(

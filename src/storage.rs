@@ -10,10 +10,24 @@ use std::{
     fs::File,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const SCHEMA_VERSION: i64 = 2;
+pub const RESET_CODE: &str = "workspace_reset_required";
+pub const RESET_MESSAGE: &str = ".architalk가 삭제되거나 교체되어 이전 상태를 더 사용하지 않습니다. 서버를 종료하고 이 프로젝트에서 다시 시작하세요.";
+
+#[derive(Debug)]
+pub struct WorkspaceResetRequired;
+impl std::fmt::Display for WorkspaceResetRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{RESET_CODE}: {RESET_MESSAGE}")
+    }
+}
+impl std::error::Error for WorkspaceResetRequired {}
 
 /// Capture committed pages, including an existing WAL, before changing the
 /// snapshot compatibility marker. The destination stays inside the pinned state
@@ -72,6 +86,24 @@ pub struct Store {
     _state: Directory,
     _lock: File,
     _root: Directory,
+    database_identity: (u64, u64),
+    invalidated: AtomicBool,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Public methods finish all statements/transactions before returning;
+        // there can be no borrowed transaction when this exclusive owner drops.
+        // CLOEXEC alone leaves flock's shared open-file description locked in
+        // an unrelated fork child until exec. End ownership explicitly before
+        // releasing the project inode lock, which serializes the next opener.
+        if let Err(error) = fs2::FileExt::unlock(&self._lock) {
+            tracing::warn!(%error, "workspace file lock release failed");
+        }
+        if let Err(error) = self._root.unlock() {
+            tracing::warn!(%error, "project inode lock release failed");
+        }
+    }
 }
 
 // SQLite's default xFullPathname resolves aliases into mutable absolute paths.
@@ -406,21 +438,64 @@ impl Store {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         state.sync()?;
+        let metadata = db.metadata()?;
         Ok(Self {
             connection,
             root,
             _state: state,
             _lock: lock,
             _root: root_dir,
+            database_identity: (metadata.dev(), metadata.ino()),
+            invalidated: AtomicBool::new(false),
         })
     }
+    /// A pinned fd prevents redirection, but must not keep a deleted/replaced
+    /// workspace alive. Once observed, a reset is terminal for this Store.
+    pub fn ensure_current(&self) -> Result<()> {
+        if self.invalidated.load(Ordering::Acquire) {
+            return Err(WorkspaceResetRequired.into());
+        }
+        let check = (|| -> Result<()> {
+            let root = Directory::root(&self.root)?;
+            if root.identity()? != self._root.identity()? {
+                bail!("project root identity changed");
+            }
+            let state = root.open_dir(".architalk")?;
+            if state.identity()? != self._state.identity()? {
+                bail!("state directory identity changed");
+            }
+            let lock = self._lock.metadata()?;
+            for (name, identity) in [
+                ("workspace.db", self.database_identity),
+                ("workspace.lock", (lock.dev(), lock.ino())),
+            ] {
+                let file = state.open_file(name, false)?;
+                let metadata = file.metadata()?;
+                if (metadata.dev(), metadata.ino()) != identity
+                    || metadata.nlink() != 1
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                {
+                    bail!("state file identity changed");
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = check {
+            self.invalidated.store(true, Ordering::Release);
+            tracing::warn!(error=%error, "project state boundary invalidated; restart required");
+            return Err(WorkspaceResetRequired.into());
+        }
+        Ok(())
+    }
     pub fn project_files(&self) -> Result<ProjectFiles> {
+        self.ensure_current()?;
         Ok(ProjectFiles::from_directory(self._root.try_clone()?))
     }
     pub fn root(&self) -> &Path {
         &self.root
     }
     pub fn load_workspace(&self) -> Result<Option<Value>> {
+        self.ensure_current()?;
         let value: Option<String> = self
             .connection
             .query_row("SELECT snapshot FROM workspace WHERE id=1", [], |r| {
@@ -432,6 +507,7 @@ impl Store {
             .transpose()
     }
     pub fn find_receipt(&self, command_id: &str) -> Result<Option<Receipt>> {
+        self.ensure_current()?;
         let value: Option<(String, String)> = self
             .connection
             .query_row(
@@ -455,6 +531,7 @@ impl Store {
         command: Option<ReceiptInput>,
         event: Option<EventInput>,
     ) -> Result<Option<EventRecord>> {
+        self.ensure_current()?;
         let snapshot = serde_json::to_string(snapshot)?;
         let tx = self.connection.transaction()?;
         // Duplicate receipt insert is a hard error: rollback includes snapshot/event.
@@ -488,10 +565,12 @@ impl Store {
             None
         };
         tx.commit()?;
+        self.ensure_current()?;
         Ok(event)
     }
     /// Replay is bounded; clients can reconnect with the last returned cursor.
     pub fn events_after(&self, session_id: Option<&str>, cursor: u64) -> Result<Vec<EventRecord>> {
+        self.ensure_current()?;
         if cursor > i64::MAX as u64 {
             return Ok(Vec::new());
         }
@@ -516,6 +595,7 @@ impl Store {
         .collect()
     }
     pub fn latest_cursor(&self) -> Result<u64> {
+        self.ensure_current()?;
         Ok(self
             .connection
             .query_row("SELECT COALESCE(MAX(cursor),0) FROM events", [], |r| {

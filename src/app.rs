@@ -1,7 +1,7 @@
 //! Single-writer application boundary. No DB transaction is held across AI work.
 use crate::{
     ai,
-    config::Settings,
+    config::{self, Settings},
     design_package::{DesignDocument, DocumentKind, MAIN_FILENAME, package_hash},
     domain, files,
     model::*,
@@ -37,6 +37,9 @@ impl AppError {
 }
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
+        if e.is::<crate::storage::WorkspaceResetRequired>() {
+            return Self::new(crate::storage::RESET_CODE, crate::storage::RESET_MESSAGE);
+        }
         tracing::error!(error=%e,"application operation failed");
         Self::new("operation_failed", e.to_string())
     }
@@ -46,6 +49,7 @@ struct Inner {
     state: Workspace,
     store: Store,
     cancellations: HashMap<String, CancellationToken>,
+    shared_ai_hash: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub struct LiveEvent {
@@ -63,6 +67,7 @@ pub struct App {
     pub shutdown: CancellationToken,
     diagnostic_gate: tokio::sync::Mutex<()>,
     trusted: Settings,
+    shared_config: Option<PathBuf>,
 }
 struct Launch {
     run_id: String,
@@ -73,6 +78,16 @@ struct Launch {
 
 impl App {
     pub fn open(root: &Path, settings: Settings) -> anyhow::Result<Arc<Self>> {
+        Self::open_internal(root, settings, None)
+    }
+    pub fn open_with_shared_config(root: &Path, path: &Path) -> anyhow::Result<Arc<Self>> {
+        Self::open_internal(root, config::load(path)?, Some(path.to_owned()))
+    }
+    fn open_internal(
+        root: &Path,
+        settings: Settings,
+        shared_config: Option<PathBuf>,
+    ) -> anyhow::Result<Arc<Self>> {
         let mut store = Store::open(root)?;
         let project_files = store.project_files()?;
         let root = store.root().to_owned();
@@ -82,10 +97,23 @@ impl App {
             }
             None => Workspace::new(settings.clone()),
         };
+        let previous_ai = state.settings.ai.clone();
         // A stored initial snapshot is not an implicit override of later user config.
         if !state.settings_overridden && state.settings_revision == 0 {
             state.settings = settings.clone();
         }
+        // Shared preferences are authoritative for AI settings; document paths
+        // and all project/run history stay inside this workspace.
+        if shared_config.is_some() {
+            if previous_ai != settings.ai {
+                state.settings_revision += 1;
+            }
+            state.settings.ai = settings.ai.clone();
+        }
+        let shared_ai_hash = shared_config
+            .as_ref()
+            .map(|_| config::ai_hash(&state.settings.ai))
+            .transpose()?;
         // Executables/profile are always controlled by the current trusted user config.
         state.settings.ai.backends.claude.executable =
             settings.ai.backends.claude.executable.clone();
@@ -128,18 +156,52 @@ impl App {
                 state,
                 store,
                 cancellations: HashMap::new(),
+                shared_ai_hash,
             }),
             events,
             shutdown: CancellationToken::new(),
             diagnostic_gate: tokio::sync::Mutex::new(()),
             trusted: settings,
+            shared_config,
         }))
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
+    fn checked_lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>> {
+        let mut inner = self.lock();
+        if let Err(error) = inner.store.ensure_current() {
+            for cancel in inner.cancellations.values() {
+                cancel.cancel();
+            }
+            inner.cancellations.clear();
+            inner.state.sessions.clear();
+            inner.state.runs.clear();
+            inner.state.exports.clear();
+            return Err(error.into());
+        }
+        Ok(inner)
+    }
+    pub fn ensure_workspace_current(&self) -> Result<()> {
+        drop(self.checked_lock()?);
+        Ok(())
+    }
+    fn sync_shared_ai(&self, inner: &mut Inner) -> Result<()> {
+        let Some(path) = &self.shared_config else {
+            return Ok(());
+        };
+        let loaded = config::load(path)?;
+        let fingerprint = config::ai_hash(&loaded.ai)?;
+        if inner.shared_ai_hash.as_deref() != Some(&fingerprint) {
+            inner.state.settings.ai = loaded.ai;
+            inner.state.settings_revision += 1;
+            inner.shared_ai_hash = Some(fingerprint);
+        }
+        Ok(())
+    }
     pub fn workspace(&self) -> Result<Value> {
-        let i = self.lock();
+        let mut i = self.checked_lock()?;
+        self.sync_shared_ai(&mut i)?;
         let scan = self.files.scan()?;
         let mut document_types =
             vec![json!({"kind":"architecture","filename":MAIN_FILENAME,"title":"아키텍처 설계"})];
@@ -153,7 +215,7 @@ impl App {
         )
     }
     pub fn session(&self, id: &str) -> Result<Value> {
-        let i = self.lock();
+        let i = self.checked_lock()?;
         let s = find_session(&i.state, id)?;
         let mut v = serde_json::to_value(s)?;
         v["cursor"] = json!(i.store.latest_cursor()?);
@@ -163,7 +225,7 @@ impl App {
         Ok(v)
     }
     pub fn run(&self, id: &str) -> Result<Value> {
-        let i = self.lock();
+        let i = self.checked_lock()?;
         Ok(serde_json::to_value(
             i.state
                 .runs
@@ -172,22 +234,25 @@ impl App {
                 .ok_or_else(|| AppError::new("not_found", "작업을 찾을 수 없습니다."))?,
         )?)
     }
-    pub fn settings(&self) -> Value {
-        let i = self.lock();
-        json!({"settings":i.state.settings,"revision":i.state.settings_revision,"diagnostics":[],"choices":{
-            "claude":ai::Backend::Claude.choices(),
-            "codex":ai::Backend::Codex.choices()
-        }})
+    pub fn settings(&self) -> Result<Value> {
+        let mut i = self.checked_lock()?;
+        self.sync_shared_ai(&mut i)?;
+        Ok(
+            json!({"settings":i.state.settings,"revision":i.state.settings_revision,"diagnostics":[],"choices":{
+                "claude":ai::Backend::Claude.choices(),
+                "codex":ai::Backend::Codex.choices()
+            }}),
+        )
     }
     pub fn draft(&self, id: &str) -> Result<Value> {
-        let i = self.lock();
+        let i = self.checked_lock()?;
         let s = find_session(&i.state, id)?;
         Ok(
             json!({"drafts":s.drafts,"draft":s.drafts.last(),"findings":s.findings,"content_status":s.content_status,"readiness_issues":s.drafts.last().map(|d|domain::readiness(s,d)).unwrap_or_default()}),
         )
     }
     pub fn export(&self, sid: &str, eid: &str) -> Result<Value> {
-        let i = self.lock();
+        let i = self.checked_lock()?;
         Ok(serde_json::to_value(
             i.state
                 .exports
@@ -197,7 +262,7 @@ impl App {
         )?)
     }
     pub fn replay(&self, sid: Option<&str>, after: u64) -> Result<Vec<EventRecord>> {
-        Ok(self.lock().store.events_after(sid, after)?)
+        Ok(self.checked_lock()?.store.events_after(sid, after)?)
     }
     pub async fn diagnostics(&self) -> Result<Value> {
         let _gate = self.diagnostic_gate.lock().await;
@@ -206,7 +271,8 @@ impl App {
         }
         // A help/version probe owns the same project process slot BEFORE spawn.
         let (settings, rid, sid) = {
-            let mut i = self.lock();
+            let mut i = self.checked_lock()?;
+            self.sync_shared_ai(&mut i)?;
             check_idle(&i.state)?;
             let mut next = i.state.clone();
             let rid = id();
@@ -256,15 +322,26 @@ impl App {
             }
             (settings, rid, sid)
         };
-        let c = ai::diagnose(ai::Backend::Claude, &settings.ai.backends.claude.executable).await;
+        let c = ai::diagnose_in_project(
+            ai::Backend::Claude,
+            &settings.ai.backends.claude.executable,
+            &self.root,
+        )
+        .await;
+        self.ensure_workspace_current()?;
         let results = if c.termination_unknown {
             vec![c]
         } else {
-            let x = ai::diagnose(ai::Backend::Codex, &settings.ai.backends.codex.executable).await;
+            let x = ai::diagnose_in_project(
+                ai::Backend::Codex,
+                &settings.ai.backends.codex.executable,
+                &self.root,
+            )
+            .await;
             vec![c, x]
         };
         let unknown = results.iter().any(|d| d.termination_unknown);
-        let mut i = self.lock();
+        let mut i = self.checked_lock()?;
         let mut next = i.state.clone();
         let r = next
             .runs
@@ -333,7 +410,8 @@ impl App {
             target,
             command.payload
         ]))?);
-        let mut i = self.lock();
+        let mut i = self.checked_lock()?;
+        self.sync_shared_ai(&mut i)?;
         if let Some(r) = i.store.find_receipt(&command.command_id)? {
             if r.payload_hash == payload_hash {
                 return Ok(r.response);
@@ -406,9 +484,22 @@ impl App {
                     serde_json::from_value(command.payload.get("settings").cloned().ok_or_else(
                         || AppError::new("invalid_settings", "settings가 필요합니다."),
                     )?)?;
+                let trusted = if let Some(path) = &self.shared_config {
+                    config::load(path)?
+                } else {
+                    self.trusted.clone()
+                };
                 settings
-                    .validate_web_change(&self.trusted)
+                    .validate_web_change(&trusted)
                     .map_err(|e| AppError::new("invalid_settings", e.to_string()))?;
+                if let Some(path) = &self.shared_config {
+                    config::save_ai(
+                        path,
+                        &settings.ai,
+                        i.shared_ai_hash.as_deref().unwrap_or_default(),
+                    )
+                    .map_err(|e| AppError::new("shared_settings_conflict", e.to_string()))?;
+                }
                 next.settings = settings;
                 next.settings_overridden = true;
                 next.settings_revision += 1;
@@ -765,6 +856,9 @@ impl App {
             }),
         )?;
         i.state = next;
+        if operation == "settings" && self.shared_config.is_some() {
+            i.shared_ai_hash = Some(config::ai_hash(&i.state.settings.ai)?);
+        }
         if let Some(l) = &launch {
             i.cancellations.insert(l.run_id.clone(), l.cancel.clone());
         }
@@ -778,6 +872,9 @@ impl App {
         Ok(response)
     }
     fn publish_record(&self, e: EventRecord) {
+        if self.ensure_workspace_current().is_err() {
+            return;
+        }
         let _ = self.events.send(LiveEvent {
             session_id: e.session_id.unwrap_or_default(),
             run_id: None,
@@ -805,12 +902,36 @@ impl App {
         });
     }
     async fn execute(self: Arc<Self>, l: Launch) {
+        if self.ensure_workspace_current().is_err() {
+            return;
+        }
+        let monitor_done = CancellationToken::new();
+        let _monitor_guard = monitor_done.clone().drop_guard();
+        let monitor_app = Arc::downgrade(&self);
+        let monitor_cancel = l.cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = monitor_done.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        let Some(app) = monitor_app.upgrade() else { break; };
+                        if app.ensure_workspace_current().is_err() {
+                            monitor_cancel.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         let (tx, mut rx) = mpsc::channel(64);
         let app = self.clone();
         let sid = l.session.id.clone();
         let rid = l.run_id.clone();
         let forward = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
+                if app.ensure_workspace_current().is_err() {
+                    break;
+                }
                 let value = serde_json::to_value(event).unwrap_or(Value::Null);
                 let kind = value
                     .get("type")
@@ -837,6 +958,11 @@ impl App {
         tracing::info!(run_id=%l.run_id,role=%kind,phase="ai_start","run phase");
         let spec = l.spec;
         let mut result = ai::generate(spec.clone(), l.cancel.clone(), tx.clone()).await;
+        if self.ensure_workspace_current().is_err() {
+            drop(tx);
+            let _ = forward.await;
+            return;
+        }
         // Design validation failures must not trigger another paid generation.
         // Conversation/critic retain their one schema repair.
         if kind != "design" {
@@ -871,7 +997,7 @@ impl App {
         kind: &str,
         result: std::result::Result<ai::AiOutput, ai::AiError>,
     ) -> Result<()> {
-        let mut i = self.lock();
+        let mut i = self.checked_lock()?;
         let mut next = i.state.clone();
         let rpos = next
             .runs
@@ -1027,7 +1153,9 @@ impl App {
         Ok(())
     }
     fn fail_completion(&self, rid: &str, message: &str) {
-        let mut i = self.lock();
+        let Ok(mut i) = self.checked_lock() else {
+            return;
+        };
         let mut next = i.state.clone();
         if let Some(r) = next.runs.iter_mut().find(|r| r.id == rid) {
             r.status = "failed".into();
@@ -1056,7 +1184,9 @@ impl App {
     }
     pub fn stop(&self) {
         self.shutdown.cancel();
-        let mut i = self.lock();
+        let Ok(mut i) = self.checked_lock() else {
+            return;
+        };
         let mut next = i.state.clone();
         for r in &mut next.runs {
             if r.status == "running" {
@@ -1078,7 +1208,10 @@ impl App {
         }
     }
     pub fn is_idle(&self) -> bool {
-        self.workers.load(Ordering::SeqCst) == 0 && active_run(&self.lock().state).is_none()
+        self.workers.load(Ordering::SeqCst) == 0
+            && self
+                .checked_lock()
+                .map_or(true, |inner| active_run(&inner.state).is_none())
     }
 }
 fn validate_output(s: &Session, kind: &str, text: &str) -> anyhow::Result<()> {

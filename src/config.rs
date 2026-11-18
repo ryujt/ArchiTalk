@@ -1,8 +1,11 @@
 use crate::ai::{Backend, RunSpec};
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -199,4 +202,50 @@ pub fn load(path: &Path) -> Result<Settings> {
     };
     settings.validate()?;
     Ok(settings)
+}
+
+pub fn ai_hash(ai: &AiConfig) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(ai)?)))
+}
+
+/// Only generic AI preferences are shared. Project output paths, conversation
+/// content and run records never enter the common configuration file.
+pub fn save_ai(path: &Path, ai: &AiConfig, expected_hash: &str) -> Result<String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).context("create shared settings directory")?;
+    let name = path.file_name().context("settings file needs a filename")?;
+    let mut lock_name = name.to_os_string();
+    lock_name.push(".lock");
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = options
+        .open(parent.join(lock_name))
+        .context("lock shared settings")?;
+    lock.lock_exclusive()?;
+    let mut current = load(path)?;
+    let current_hash = ai_hash(&current.ai)?;
+    let desired_hash = ai_hash(ai)?;
+    if current_hash != expected_hash && current_hash != desired_hash {
+        bail!(
+            "shared_settings_conflict: another process changed the common AI settings; reload settings before saving"
+        );
+    }
+    if current_hash != desired_hash {
+        current.ai = ai.clone();
+        current.validate()?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        file.write_all(toml::to_string_pretty(&current)?.as_bytes())?;
+        file.as_file().sync_all()?;
+        file.persist(path).map_err(|e| e.error)?;
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(desired_hash)
 }

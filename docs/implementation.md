@@ -6,13 +6,17 @@
 
 Rust 바이너리에 `web/` 정적 자산을 포함한다. 시작 시 cwd 또는 `--project`를 고정하고 root inode와 상태 파일을 잠근 뒤 loopback listener를 연다. API는 프로세스 토큰·정확한 Host/Origin으로 보호한다. 브라우저는 URL fragment 토큰을 제거하고 같은 origin의 fetch HTTP/SSE를 사용한다.
 
-`App`은 하나의 논리 writer이며, 짧은 SQLite transaction에 workspace snapshot·receipt·event를 함께 저장한다. AI를 기다리는 동안 DB lock을 유지하지 않는다. 모델 프로세스와 help 진단은 같은 프로젝트 실행 slot을 선예약한다. 생성 중 설정 변경은 다음 run에 적용한다.
+`App`은 하나의 논리 writer이며, 짧은 SQLite transaction에 workspace snapshot·receipt·event를 함께 저장한다. AI를 기다리는 동안 DB lock을 유지하지 않는다. 모델 프로세스와 help 진단은 같은 프로젝트 실행 slot을 선예약한다. 생성 중 설정 변경은 다음 run에 적용한다. 제품 main은 공통 설정 파일을 App에 연결하고 AI 설정을 매 작업 전에 다시 읽는다. 웹 저장은 파일 lock·내용 hash 비교·atomic rename으로 AI 일반 설정만 갱신한다. 문서 경로·대화·run은 프로젝트 DB에 남는다. 테스트의 `App::open`은 공통 파일을 건드리지 않는 격리 모드다.
 
 AI 작업의 기본 시간 제한은 300초이며 웹/TOML 설정의 `ai.timeout_seconds`로 10..600초를 지정한다. 기존 프로젝트에 명시적으로 저장한 값은 유지하고, 대화·설계·검토 각각의 run 시작 시 설정을 고정한다.
 
 DB schema는 2다. v1에서 이행하기 전에 SQLite online backup으로 WAL의 확정 내용까지 포함한 별도 DB를 만들고, schema 번호를 갱신한다. 이전 실행 파일은 더 새로운 schema를 거부한다. 과거 snapshot의 `Draft.documents` 누락은 빈 목록으로 읽고 기존 단일 문서 hash와 발행 복구를 유지한다.
 
+프로젝트 root·`.architalk`·DB의 실제 파일 identity가 실행 중 바뀌면 `workspace_reset_required`로 이전 workspace 제공과 저장을 차단한다. old inode의 메모리/SQLite를 새 폴더에 복사하지 않으며 진행 중 프로세스를 중지한다. HTTP 410/SSE 알림을 받은 브라우저도 대화·문서 캐시를 비우고 서버 재시작을 안내한다. 새 서버는 보이는 새 폴더만 읽는다.
+
 프로세스 결과는 terminal event·exit·출력 스키마·참조를 모두 확인한 뒤 반영한다. 취소·오류·태스크 panic은 완료와 구분하고 종료 미확인 상태는 재시작 후에도 보존한다. 설계 문서가 만들어진 뒤 비판 검토 준비가 실패하면 초안과 설계 완료 결과는 보존하고 검토 실패를 따로 기록한다.
+
+버전/help 진단부터 프로젝트 runtime에서 쓰기 제한을 적용한다. Claude는 2.1.326/2.1.327 명시 프로필과 필수 제한 옵션을 함께 확인한다. Codex는 native HOME도 run-local로 두고 공용 파일 인증을 metadata 검증 뒤 읽기 symlink로 연결한다. 공용 인증의 복사·쓰기는 허용하지 않으며 키체인 전용 Codex 인증은 지원하지 않는다. 실패 진단은 고정 reason/component 분류만 남겨 stderr의 원문·토큰·프롬프트를 노출하지 않는다.
 
 ## 공개 API
 
@@ -60,7 +64,7 @@ DB schema는 2다. v1에서 이행하기 전에 SQLite online backup으로 WAL�
 | 로컬 Rust CLI + 웹 대화 | 포함된 HTML/CSS/JS, Node 실행 의존성 없음 |
 | Claude/Codex·모델·생각 수준 | 역할별 선택·고정 run 설정, 실제 CLI stdout 프로토콜 해석 |
 | CLI 버전/권한 | 검증한 정확한 버전 프로필, macOS 프로젝트 쓰기 차단. 다른 OS 빌드·named profile은 미지원; 미검증 실행 조건은 거부 |
-| 설정 계층 | 사용자 TOML + 명시적 프로젝트 웹 설정(SQLite). 저장소의 임의 실행파일/args/env는 로드하지 않음 |
+| 설정 계층 | 공통 TOML의 에이전트·모델·생각 수준·시간 제한 + 프로젝트 DB의 문서 설정. 저장소의 임의 실행파일/args/env는 로드하지 않음 |
 | 문서 분할 | 주 아키텍처 + 9종 상세 Markdown과 manifest, 과거 단일 문서 호환. 외부 pack/template과 자동 다중 프로젝트 분할은 확장 지점 |
 | 구조와 추적성 | Method-R, 드라이버·품질 시나리오·대안·ADR·검증 ID와 문서 링크. 실제 근거·업무 판단·성능 수치는 사람의 검토 대상 |
 | 문서 표시 | 정화된 Markdown·SmartMD·Mermaid·Navigation/Jobflow/State/Layout, 종류 선택과 패키지 내부 링크. HTML 프로토타입 생성 없음 |

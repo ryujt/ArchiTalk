@@ -313,6 +313,64 @@ fn lock_child_probe() {
 }
 
 #[test]
+fn dropping_store_releases_locks_even_while_an_unrelated_child_is_before_exec() {
+    use std::{
+        io::{Read, Write},
+        os::{fd::AsRawFd, unix::net::UnixStream, unix::process::CommandExt},
+        time::Duration,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path()).unwrap();
+    let (mut parent_gate, child_gate) = UnixStream::pair().unwrap();
+    parent_gate
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let worker = std::thread::spawn(move || {
+        let fd = child_gate.as_raw_fd();
+        let mut command = Command::new("/usr/bin/true");
+        // Only async-signal-safe syscalls run between fork and exec. Keeping
+        // this child gated exposes inherited CLOEXEC descriptors deterministically.
+        unsafe {
+            command.pre_exec(move || {
+                let byte: u8 = 1;
+                if libc::write(fd, (&byte as *const u8).cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut release: u8 = 0;
+                if libc::read(fd, (&mut release as *mut u8).cast(), 1) != 1 {
+                    return Err(std::io::Error::other("pre-exec gate closed"));
+                }
+                Ok(())
+            });
+        }
+        let result = command.spawn().and_then(|mut child| child.wait());
+        drop(child_gate);
+        result
+    });
+    let ready = parent_gate.read_exact(&mut [0]);
+    // No assertions before releasing the child: failures must not leave a
+    // blocked pre_exec process or join thread behind.
+    let locked_while_owner_exists = ready.is_ok() && Store::open(root.path()).is_err();
+    drop(store);
+    let reopened = ready.is_ok().then(|| Store::open(root.path()));
+    let released = parent_gate.write_all(&[1]);
+    drop(parent_gate);
+    let child_result = worker.join().unwrap();
+    assert!(ready.is_ok(), "child never reached the pre-exec gate");
+    assert!(released.is_ok());
+    assert!(child_result.unwrap().success());
+    assert!(
+        locked_while_owner_exists,
+        "a live Store must retain its lock"
+    );
+    assert!(
+        reopened.unwrap().is_ok(),
+        "a dropped Store must not leave its lock owned by an unrelated fork child"
+    );
+}
+
+#[test]
 fn sqlite_journal_hardlink_created_after_open_cannot_modify_external_file() {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -351,9 +409,13 @@ fn project_inode_lock_survives_state_directory_replacement() {
             .next()
             .is_none()
     );
-    store
-        .commit_workspace(&json!({"held":"original"}), None, None)
-        .unwrap();
+    assert!(
+        store
+            .commit_workspace(&json!({"held":"original"}), None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("workspace_reset_required")
+    );
     drop(store);
     assert!(Store::open(root.path()).is_ok());
 }

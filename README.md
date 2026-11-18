@@ -31,7 +31,7 @@ ArchiTalk의 목적은 기술 이름부터 고르는 대신, **무엇을 만들�
 
 ## 빠른 시작
 
-현재 AI 실행을 검증한 환경은 **macOS**입니다. 지원 프로필은 Claude Code **2.1.326**, Codex CLI **0.169.0**이며 둘 중 사용할 도구 하나를 설치하고 먼저 로그인하세요. 다른 버전은 `doctor`에서 미지원으로 안내합니다. 로컬 CLI를 사용해도 모델 처리는 해당 도구의 서비스·인증·이용 조건을 따릅니다.
+현재 AI 실행을 검증한 환경은 **macOS**입니다. 지원 프로필은 Claude Code **2.1.326·2.1.327**, Codex CLI **0.169.0**이며 둘 중 사용할 도구 하나를 설치하고 먼저 로그인하세요. 다른 버전은 `doctor`에서 실제 확인한 버전과 미지원 이유를 안내합니다. 로컬 CLI를 사용해도 모델 처리는 해당 도구의 서비스·인증·이용 조건을 따릅니다.
 
 소스 설치에는 Rust/Cargo와 C 컴파일러가 필요합니다.
 
@@ -61,7 +61,7 @@ architalk --config /path/to/config.toml
 
 ## 모델과 생각 수준 설정
 
-설정 파일은 `$XDG_CONFIG_HOME/architalk/config.toml`, 환경변수가 없으면 `~/.config/architalk/config.toml`입니다. [설정 예시](config.example.toml)를 복사하거나 `--config`로 경로를 지정하세요. 파일이 없어도 기본 설정으로 시작합니다.
+공통 설정 파일은 `$XDG_CONFIG_HOME/architalk/config.toml`, 환경변수가 없으면 `~/.config/architalk/config.toml`입니다. [설정 예시](config.example.toml)를 복사하거나 `--config`로 사용할 공통 파일을 지정하세요. 파일이 없어도 기본 설정으로 시작합니다. 웹에서 저장한 에이전트·모델·생각 수준·시간 제한은 이 파일에 기록하며 다른 프로젝트의 다음 작업에도 적용합니다. 문서 저장 폴더와 프로젝트 기록은 각 프로젝트에 따로 보관합니다.
 
 - Claude는 `-p`, Codex는 `exec`로 비대화형 호출합니다. Codex의 `-p`는 프로필 옵션이며 현재 격리 프로필에서 named profile은 지원하지 않습니다.
 - 기본 도구·모델·생각 수준과 대화/설계 작성/비판 검토 역할별 설정을 선택할 수 있습니다. 모델과 생각 수준은 알려진 값 목록에서 고르거나 바로 아래 입력란에 직접 입력하세요. 역할의 목록은 선택한 도구를 따르며, 도구를 바꿔도 입력한 값은 유지합니다. 기본 설정의 빈칸은 CLI 기본값, 역할 설정의 빈칸은 선택한 도구의 기본 설정을 사용합니다.
@@ -73,7 +73,9 @@ architalk --config /path/to/config.toml
 
 ## 문서와 대화 기록
 
-대화·근거·설계 버전·실행·저장 상태는 프로젝트의 `.architalk/workspace.db`에 보관합니다. `.architalk/`를 Git 제외 목록에 추가하세요. 앱은 기존 `.gitignore`를 자동 수정하지 않습니다.
+대화·근거·설계 버전·실행·저장 상태는 프로젝트의 `.architalk/workspace.db`에 보관합니다. 프로젝트별 CLI 실행 디렉터리와 임시 파일도 `.architalk/runtime/` 아래에서 만들고 정리합니다. 공용 설정 파일에는 대화·프로젝트 경로·실행 이력을 저장하지 않습니다. `.architalk/`를 Git 제외 목록에 추가하세요. 앱은 기존 `.gitignore`를 자동 수정하지 않습니다.
+
+기록을 초기화하려면 서버를 종료하고 해당 프로젝트의 `.architalk/`를 삭제한 뒤 다시 실행하세요. 실행 중 폴더나 DB를 삭제·교체해도 이전 메모리 내용을 새 폴더에 복원하지 않습니다. 서버가 변경을 감지하면 이전 내용 표시와 작업을 중단하고 재시작을 안내합니다. 브라우저는 대화 본문을 저장하지 않습니다. 공통 AI 설정은 초기화 후에도 유지합니다.
 
 출력 예시는 `docs/architecture/회원-알림-서비스/` 아래의 10개 Markdown 파일과 저장 확인용 manifest입니다. 다음 저장은 `회원-알림-서비스-개정-2/` 같은 새 폴더를 사용하고 기존 문서를 덮어쓰지 않습니다. 저장 전에 경로·파일·내용을 확인할 수 있습니다. **초안 버전**에서 이전 초안을 선택하면 당시 문서와 원문을 확인하고 그 버전 전체를 저장할 수 있습니다. 파일 저장과 내용 수락은 구분하며, 과거의 단일 문서 초안도 원문과 기존 저장 방식을 유지합니다.
 
@@ -112,6 +114,7 @@ npm run test:browser
 cargo test --test ai_adapter real_ -- --ignored --nocapture --test-threads=1
 cargo test --test real_workflow -- --ignored --nocapture --test-threads=1
 cargo test --test real_document_format -- --ignored --nocapture # Codex 설계 1회
+cargo test --test real_project_isolation -- --ignored --nocapture # Claude/Codex 짧은 요청 각 1회
 ```
 
 두 번째 명령은 실제 바이너리→로컬 HTTP/SSE→CLI 대화·설계·검토→문서 저장→재시작을 임시 프로젝트에서 확인합니다. [검증 실행 이력](tests/test-history/README.md)에서 성공·실패·미실행 범위를 구분합니다.
@@ -126,7 +129,9 @@ cargo test --test real_document_format -- --ignored --nocapture # Codex 설계 1
 
 ## 지원 경계
 
-AI 작업은 프로젝트 밖 임시 디렉터리에서 실행하고 macOS `sandbox-exec`로 원본 프로젝트 쓰기를 차단합니다. 같은 사용자 홈 전체를 격리하는 도구는 아닙니다. 관리형 CLI 정책을 검증할 수 없거나 필요한 제한을 적용할 수 없으면 실행을 거부합니다. 현재 릴리스 대상은 macOS와 로컬 파일시스템이며 Linux·Windows 빌드/AI 실행, 네트워크 공유 폴더, 임의 named profile은 아직 지원하지 않습니다.
+AI 작업은 프로젝트의 `.architalk/runtime/` 안에서 실행하고 macOS `sandbox-exec`로 CLI 파일 쓰기를 해당 실행 디렉터리로 제한합니다. 기존 CLI 인증은 읽어 재사용하며 공용 홈에 프로젝트 세션·로그를 쓰지 않습니다. 인증 갱신에 공용 파일 쓰기가 필요한 경우에는 터미널에서 해당 CLI에 다시 로그인해야 합니다. 관리형 CLI 정책을 검증할 수 없거나 필요한 제한을 적용할 수 없으면 실행을 거부합니다. 현재 릴리스 대상은 macOS와 로컬 파일시스템이며 Linux·Windows 빌드/AI 실행, 네트워크 공유 폴더, 임의 named profile은 아직 지원하지 않습니다.
+
+Codex는 실행용 `CODEX_HOME`도 프로젝트 runtime 안으로 분리하고, 기존 파일 인증을 읽기 링크로 재사용합니다. 인증 파일은 복사하지 않습니다. 현재 Codex 프로필은 파일 인증 또는 기존 API-key 환경을 사용하며, 키체인에만 저장된 인증은 지원하지 않습니다. Claude의 기존 로그인은 그대로 재사용합니다.
 
 부모 프로세스의 강제 종료·전원 손실·임의로 분리된 프로세스까지 정리를 보장하지 않습니다. 중단 뒤 종료 미확인 게이트를 유지합니다. 원격 공동 편집·코드 구현/수정·전체 저장소 무제한 탐색은 제공하지 않습니다. 문서 HTML과 생성 SVG를 정화하고 문서의 스크립트·앱 제어 속성·자동 외부 리소스 요청을 차단합니다. 기본 진단은 stderr에 제한된 단계·오류만 기록하고 프롬프트·응답 전문·인증 정보를 로그로 남기지 않습니다.
 

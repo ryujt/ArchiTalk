@@ -35,24 +35,6 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let settings = config::load(&cli.config.unwrap_or_else(config::default_path))?;
-    if matches!(cli.command, Some(Commands::Doctor)) {
-        let (c, x) = tokio::join!(
-            architalk::ai::diagnose(
-                architalk::ai::Backend::Claude,
-                &settings.ai.backends.claude.executable
-            ),
-            architalk::ai::diagnose(
-                architalk::ai::Backend::Codex,
-                &settings.ai.backends.codex.executable
-            )
-        );
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({"diagnostics":[c,x]}))?
-        );
-        return Ok(());
-    }
     let project = cli
         .project
         .unwrap_or(std::env::current_dir()?)
@@ -61,7 +43,29 @@ async fn main() -> Result<()> {
     if !project.is_dir() {
         bail!("--project must identify a directory");
     }
-    let app = App::open(&project, settings)?;
+    let config_path = cli.config.unwrap_or_else(config::default_path);
+    let settings = config::load(&config_path)?;
+    if matches!(cli.command, Some(Commands::Doctor)) {
+        let _store = architalk::storage::Store::open(&project)?;
+        let (c, x) = tokio::join!(
+            architalk::ai::diagnose_in_project(
+                architalk::ai::Backend::Claude,
+                &settings.ai.backends.claude.executable,
+                &project
+            ),
+            architalk::ai::diagnose_in_project(
+                architalk::ai::Backend::Codex,
+                &settings.ai.backends.codex.executable,
+                &project
+            )
+        );
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"diagnostics":[c,x]}))?
+        );
+        return Ok(());
+    }
+    let app = App::open_with_shared_config(&project, &config_path)?;
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, cli.port)).await?;
     let authority = listener.local_addr()?.to_string();
     let token = format!(

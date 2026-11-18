@@ -15,6 +15,7 @@ async fn real_codex_returns_a_method_r_design_package() {
         )
     } else {
         let project = tempfile::tempdir().unwrap();
+        let _store = architalk::storage::Store::open(project.path()).unwrap();
         let session = domain::new_session(
             "합성 자료 열람 웹 도구".into(),
             "개인용 자료 열람 웹 도구를 설계한다. 목록 화면에서 자료를 선택하면 상세 화면이 열리고 목록으로 복귀할 수 있다. 조회 실패는 목록에서 오류를 보이고 재시도한다. 로컬 JSON 자료를 읽기만 하며 수정·로그인·과금·외부 연동은 제외한다. 한 사람이 로컬에서 사용한다. 부하와 배포 환경은 미정이다. 확정하지 않은 정책은 미정으로 남기고 Method-R 구조, 드라이버, 품질 시나리오, 대안과 트레이드오프, ADR, 구현·운영 검증 및 네비게이션·잡플로우·상태도·화면설계를 종류별로 작성한다. 작은 프로젝트여도 중요한 선택의 근거와 조건부 대안·검증 계획을 생략하지 않는다.".into(),

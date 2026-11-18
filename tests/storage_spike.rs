@@ -82,9 +82,15 @@ fn p0_sqlite_state_directory_swap_does_not_follow_external_symlink() {
     )
     .unwrap();
     symlink(outside.path(), root.path().join(".architalk")).unwrap();
-    store
+    let previous_bytes = fs::read(root.path().join("saved-state/workspace.db")).unwrap();
+    let error = store
         .commit_workspace(&json!({"pinned":true}), None, None)
-        .unwrap();
+        .unwrap_err();
+    assert!(error.is::<architalk::storage::WorkspaceResetRequired>());
+    assert!(store.load_workspace().is_err());
     assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
-    assert!(root.path().join("saved-state/workspace.db").is_file());
+    assert_eq!(
+        fs::read(root.path().join("saved-state/workspace.db")).unwrap(),
+        previous_bytes
+    );
 }

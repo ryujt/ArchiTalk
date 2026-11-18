@@ -30,5 +30,9 @@
 | 문서 종류 선택·패키지 링크·anchor | [design-package-ui](design-package-ui-20261118.md) | 기존·신규 Node 28건 통과, 시간 제한 설정 포함 |
 | 10종 문서·anchor·전체 파일 저장 브라우저 | [design-package-browser](design-package-browser-20261118.md) | desktop/mobile 전체 14건·실제 원문/시간 제한 추가 4건 통과, 실패 이력 보존 |
 | 종류별 설계·전체 검토·저장 최종 조립 | [design-package-integration](design-package-integration-20261118.md) | Rust 108·Node 28·브라우저 전체14+추가4 통과, 실제 응답·전역0.2.0 확인 |
+| 프로젝트 기록 삭제·공통 AI 설정·실제 CLI 조립 | [project-state-settings](project-state-settings-20261118.md) | Rust129·Node33·browser16+후속2·실제 Claude327/Codex tiny 요청 통과 |
+| 삭제·교체 감지·SSE·프로세스 취소·락 소유 종료 | [project-state-reset](project-state-reset-20261118.md) | 삭제 반례·fork 상속 재현 후 집중47 통과 |
+| CLI 버전·project runtime·Codex home/auth 읽기 | [project-state-ai](project-state-ai-20261118.md) | 327 명시 지원, private-home 대조·원인 수정·제한/진단 검증 |
+| 이전 화면 제거·새 연결·same-origin 재시작 | [project-state-ui](project-state-ui-20261118.md) | 최초 반례4실패 보존, Node27·browser16+후속2 통과 |
 
 최초 작업으로 참고할 이전 실행은 없었다. 후속 실행은 각 기록의 미검증·후속 조건을 먼저 확인한다.
