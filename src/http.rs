@@ -33,10 +33,14 @@ impl IntoResponse for AppError {
             }
             "unauthorized" => StatusCode::UNAUTHORIZED,
             "forbidden" => StatusCode::FORBIDDEN,
-            "operation_failed" => StatusCode::INTERNAL_SERVER_ERROR,
-            "transcription_busy" | "transcription_rate_limited" => StatusCode::TOO_MANY_REQUESTS,
-            "shutting_down" => StatusCode::SERVICE_UNAVAILABLE,
-            "transcription_timeout" => StatusCode::GATEWAY_TIMEOUT,
+            "operation_failed" | "clipboard_failed" => StatusCode::INTERNAL_SERVER_ERROR,
+            "transcription_busy" | "transcription_rate_limited" | "clipboard_busy" => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
+            "shutting_down" | "clipboard_unavailable" | "clipboard_unsupported" => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            "transcription_timeout" | "clipboard_timeout" => StatusCode::GATEWAY_TIMEOUT,
             "transcription_upstream_failed"
             | "transcription_connection_failed"
             | "transcription_response_invalid" => StatusCode::BAD_GATEWAY,
@@ -75,6 +79,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/settings/diagnostics", post(diagnostics))
         .route("/files/tree", get(viewer_tree))
         .route("/files/read", get(viewer_read))
+        .route(
+            "/clipboard",
+            post(clipboard).layer(DefaultBodyLimit::max(crate::clipboard::MAX_REQUEST_BYTES)),
+        )
         .route("/transcription/settings", get(transcription_settings))
         .route(
             "/transcription/key",
@@ -329,6 +337,26 @@ async fn viewer_read(
     Query(path): Query<ViewerPath>,
 ) -> Result<Json<Value>, AppError> {
     Ok(Json(s.app.viewer_read(path.path).await?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClipboardText {
+    text: String,
+}
+async fn clipboard(
+    State(s): State<ServerState>,
+    request: Request,
+) -> Result<Json<Value>, AppError> {
+    let Json(value) = Json::<ClipboardText>::from_request(request, &s)
+        .await
+        .map_err(|_| {
+            AppError::new(
+                "invalid_clipboard_text",
+                "복사할 text 문자열과 요청 크기를 확인하세요.",
+            )
+        })?;
+    s.app.copy_to_clipboard(&value.text).await?;
+    Ok(Json(json!({"copied":true})))
 }
 async fn transcription_settings(
     State(s): State<ServerState>,

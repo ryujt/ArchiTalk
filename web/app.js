@@ -971,7 +971,7 @@ export function startWorkspace(doc = document, win = window) {
     const epoch=state.workspaceEpoch;
     viewerPromise=Promise.all([import('./file-viewer.js'),import('./document-recorder.js'),import('./viewer-menu.js')]).then(([files,recording,menus])=>{
       if(state.disposed||state.connectionBlocked||epoch!==state.workspaceEpoch)return;
-      viewerMenu=menus.createViewerMenu({doc,win,announce});
+      viewerMenu=menus.createViewerMenu({doc,win,announce,api});
       documentRecorder=recording.createDocumentRecorder({api,getContext:currentReadingContext,mediaDevices:win.navigator.mediaDevices,MediaRecorder:win.MediaRecorder,now:()=>win.performance.now(),onChange:renderRecorderControls,onResult:result=>{if(!state.connectionBlocked&&!state.disposed)void viewerMenu.copy(result.instruction,'음성 지시문');}});
       fileWorkspace=files.createFileViewer({doc,win,api,menu:viewerMenu,announce,onActive:(path,{changed}={})=>{
         if(state.disposed)return;

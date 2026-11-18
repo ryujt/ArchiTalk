@@ -39,6 +39,11 @@ test('file tree, tabs, panels and path copying stay inside the workspace',async(
     window.__pathCopies=[];window.__denyCopy=false;
     Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async value=>{if(window.__denyCopy)throw new Error('stub denied');window.__pathCopies.push(value);}}});
   });
+  const nativeCopies=[];
+  // Never dispatch a test copy to the host operating system's real clipboard.
+  await page.route('**/api/v1/clipboard**',route=>{
+    nativeCopies.push(route.request().postDataJSON());return route.fulfill({status:503,json:{error:{code:'clipboard_unavailable',message:'SYNTHETIC_RAW_PATH_COPY_ERROR'}}});
+  });
   const reads=[],writes=[];
   page.on('request',request=>{
     const url=new URL(request.url());
@@ -76,10 +81,14 @@ test('file tree, tabs, panels and path copying stay inside the workspace',async(
     await page.getByRole('menuitem',{name:label,exact:true}).click();
     await expect.poll(()=>page.evaluate(()=>window.__pathCopies.at(-1))).toBe(value);
   }
+  expect(nativeCopies).toEqual([]);
   await page.evaluate(()=>{window.__denyCopy=true;});
   await code.click({button:'right'});await page.getByRole('menuitem',{name:'상대 경로 복사',exact:true}).click();
   await expect(page.locator('.copy-dialog')).toBeVisible();
   await expect(page.locator('#manual-copy-text')).toHaveValue('code.txt');
+  expect(nativeCopies).toEqual([{text:'code.txt'}]);
+  await expect(page.locator('.copy-dialog [data-copy-reason]')).toBeVisible();
+  await expect(page.locator('.copy-dialog')).not.toContainText('SYNTHETIC_RAW_PATH_COPY_ERROR');
   await page.getByRole('button',{name:'복사 창 닫기',exact:true}).click();
   await expect(code).toBeFocused();await left(page,false);
   const active=page.locator('#workspace-tabs [aria-selected="true"]');
@@ -97,13 +106,14 @@ test('file tree, tabs, panels and path copying stay inside the workspace',async(
   if(mobile)await expect(page.locator('#sidebar-toggle')).toHaveAttribute('aria-expanded','false');
   await geometry(page);
   await page.screenshot({path:testInfo.outputPath('file-tabs-panels.png'),fullPage:true,animations:'disabled'});
-  expect(writes).toEqual([]);
+  expect(writes).toEqual(['/api/v1/clipboard']);
   expect((await server.workspace()).sessions).toHaveLength(0);
   expect(violations).toEqual([]);expect(errors).toEqual([]);
 });
 
 test('ten-document save keeps its actions reachable on a short screen',async({server,productPage},testInfo)=>{
   const {page,errors,violations}=productPage,mobile=testInfo.project.name==='mobile';
+  await page.route('**/api/v1/clipboard**',route=>route.fulfill({status:503,json:{error:{code:'clipboard_unavailable',message:'Unexpected test copy was blocked.'}}}));
   await page.goto(server.origin,{waitUntil:'domcontentloaded'});
   await page.getByLabel('프로젝트를 한두 문장으로 소개해 주세요').fill('합성 저장 modal 검증용 알림 서비스입니다.');
   await page.getByRole('button',{name:'대화 시작',exact:true}).click();

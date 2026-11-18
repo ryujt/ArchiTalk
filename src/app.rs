@@ -70,6 +70,7 @@ pub struct App {
     trusted: Settings,
     shared_config: Option<PathBuf>,
     transcription: crate::transcription::Service,
+    pub(crate) clipboard: crate::clipboard::Service,
 }
 struct Launch {
     run_id: String,
@@ -168,6 +169,7 @@ impl App {
             trusted: settings,
             shared_config,
             transcription,
+            clipboard: crate::clipboard::Service::default(),
         }))
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -190,6 +192,40 @@ impl App {
     pub fn ensure_workspace_current(&self) -> Result<()> {
         drop(self.checked_lock()?);
         Ok(())
+    }
+    pub(crate) async fn copy_to_clipboard(&self, text: &str) -> Result<()> {
+        self.ensure_workspace_current()?;
+        if self.shutdown.is_cancelled() {
+            return Err(AppError::new("shutting_down", "서버가 종료 중입니다."));
+        }
+        let cancel = CancellationToken::new();
+        let work = self.clipboard.copy(text, &cancel);
+        tokio::pin!(work);
+        let boundary = async {
+            loop {
+                self.ensure_workspace_current()?;
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown.cancelled() => return Err(AppError::new("shutting_down", "서버가 종료 중입니다.")),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            result = boundary => {
+                cancel.cancel();
+                let _ = work.await;
+                result
+            },
+            result = &mut work => {
+                self.ensure_workspace_current()?;
+                if self.shutdown.is_cancelled() {
+                    return Err(AppError::new("shutting_down", "서버가 종료 중입니다."));
+                }
+                result.map_err(|error| AppError::new(error.code, error.message))
+            }
+        }
     }
     pub async fn viewer_tree(self: &Arc<Self>) -> Result<Value> {
         self.ensure_workspace_current()?;

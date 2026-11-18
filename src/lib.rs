@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod app;
+pub mod clipboard;
 pub mod config;
 pub mod design_generation;
 pub mod design_package;
