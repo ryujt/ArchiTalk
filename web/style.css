@@ -22,6 +22,9 @@
 .preview-bar,.preview-controls,.preview-note{display:none}
 .session-item{width:100%;text-align:left;color:inherit;overflow-wrap:anywhere}
 .session-item.selected{border-color:#91ad89;background:#fafff8}
+.generation-progress{margin:14px 0;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--paper);overflow-wrap:anywhere}
+.generation-progress progress{width:100%;height:7px;accent-color:var(--green);margin:8px 0}
+.generation-progress details{font-size:12px;margin:7px 0}.generation-progress summary{cursor:pointer}.generation-progress ul{margin:8px 0;padding-left:20px}
 .session-list{max-height:32vh;overflow:auto}.new-session{width:100%;margin-top:12px}
 .sidebar-bottom .mono{overflow-wrap:anywhere}.connection[data-state="offline"]{color:var(--amber)}
 .chat-message pre,.live-output{white-space:pre-wrap;overflow-wrap:anywhere;word-break:normal;font:inherit;line-height:1.9;margin:5px 0 0}

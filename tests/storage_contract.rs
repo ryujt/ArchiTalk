@@ -9,7 +9,7 @@ fn future_schema_and_corruption_preserve_original_database() {
         let path = root.path().join(".architalk/workspace.db");
         if future {
             let connection = rusqlite::Connection::open(&path).unwrap();
-            connection.execute_batch("PRAGMA user_version=3; CREATE TABLE future_data(value TEXT); INSERT INTO future_data VALUES('preserved');").unwrap();
+            connection.execute_batch("PRAGMA user_version=4; CREATE TABLE future_data(value TEXT); INSERT INTO future_data VALUES('preserved');").unwrap();
         } else {
             fs::write(&path, b"corrupt database must survive").unwrap();
         }
@@ -63,7 +63,7 @@ fn create_v1_database(path: &std::path::Path) -> rusqlite::Connection {
     connection
 }
 
-fn v2_backups(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
+fn v3_backups(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
     fs::read_dir(directory)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -71,14 +71,14 @@ fn v2_backups(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
             path.file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with("workspace.pre-v2-")
+                .starts_with("workspace.pre-v3-")
                 && path.extension().is_some_and(|extension| extension == "db")
         })
         .collect()
 }
 
 #[test]
-fn v1_snapshot_receipts_and_events_survive_a_backed_up_v2_marker_migration() {
+fn v1_snapshot_receipts_and_events_survive_a_backed_up_v3_marker_migration() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join(".architalk");
     fs::create_dir(&directory).unwrap();
@@ -121,7 +121,7 @@ fn v1_snapshot_receipts_and_events_survive_a_backed_up_v2_marker_migration() {
         .unwrap();
     assert_eq!(next.cursor, 2);
     drop(store);
-    let backups = v2_backups(&directory);
+    let backups = v3_backups(&directory);
     assert_eq!(backups.len(), 1);
     let backup = rusqlite::Connection::open(&backups[0]).unwrap();
     assert_eq!(
@@ -153,13 +153,13 @@ fn v1_snapshot_receipts_and_events_survive_a_backed_up_v2_marker_migration() {
     );
     drop(backup);
     drop(Store::open(root.path()).unwrap());
-    assert_eq!(v2_backups(&directory).len(), 1);
+    assert_eq!(v3_backups(&directory).len(), 1);
     let migrated = rusqlite::Connection::open(path).unwrap();
     assert_eq!(
         migrated
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
 }
 
@@ -208,7 +208,7 @@ fn migration_backup_includes_committed_pages_that_exist_only_in_the_v1_wal() {
         json!({"wal":"committed snapshot"})
     );
     drop(store);
-    let backups = v2_backups(&directory);
+    let backups = v3_backups(&directory);
     assert_eq!(backups.len(), 1);
     let backup = rusqlite::Connection::open(&backups[0]).unwrap();
     assert_eq!(

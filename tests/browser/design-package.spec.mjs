@@ -80,10 +80,17 @@ test('a connected Method-R package switches, follows anchors, survives snapshots
 
   await choose(page,'navigation');await page.locator('.markdown a').filter({hasText:'상세 배치'}).click();
   await ready(page,'screen_layout');await focusedHeading(page,'Resource Detail');
+  // Earlier documents can link a later file, whose heading anchors do not exist
+  // yet in the staged generation. Backward links still test exact anchor focus.
+  expect(draft.documents.find(document=>document.kind==='screen_layout').markdown).toContain('](네비게이션.md)');
+  await expect(page.locator('.markdown a').filter({hasText:'화면 흐름'})).toHaveAttribute('href','#');
   await page.locator('.markdown a').filter({hasText:'화면 흐름'}).click();
-  await ready(page,'navigation');await focusedHeading(page,'Screen verification');
-  await choose(page,'jobflow');await page.locator('.markdown a').filter({hasText:'부모 계약'}).click();
-  await ready(page,'architecture');await focusedHeading(page,'Method-R module design');
+  await ready(page,'navigation');await expect(page.locator('.doc-label')).toContainText('네비게이션.md');
+  await choose(page,'jobflow');
+  expect(draft.documents.find(document=>document.kind==='jobflow').markdown).toContain('](아키텍처-설계.md)');
+  await expect(page.locator('.markdown a').filter({hasText:'부모 계약'})).toHaveAttribute('href','#');
+  await page.locator('.markdown a').filter({hasText:'부모 계약'}).click();
+  await ready(page,'architecture');await expect(page.locator('.markdown').getByRole('heading',{name:'Method-R module design',exact:true})).toHaveCount(1);
   await page.locator('.markdown a').filter({hasText:'같은 문서 이동'}).click();await focusedHeading(page,'링크 검증');
   await page.locator('.markdown a').filter({hasText:'중복 제목 이동'}).click();
   await expect(page.locator('.markdown h3').filter({hasText:'중복 제목'}).nth(1)).toBeFocused();

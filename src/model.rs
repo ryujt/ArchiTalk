@@ -53,6 +53,8 @@ pub struct Session {
     pub coverage: Vec<Coverage>,
     pub questions: Vec<Question>,
     pub drafts: Vec<Draft>,
+    #[serde(default)]
+    pub design_generations: Vec<DesignCheckpoint>,
     pub findings: Vec<Finding>,
     pub content_status: String,
     pub active_run_id: Option<String>,
@@ -156,6 +158,28 @@ pub struct Draft {
     pub created_at: String,
     pub content_status: String,
     pub reviewed: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesignCheckpoint {
+    pub id: String,
+    pub input_revision: u64,
+    pub input_hash: String,
+    pub contract_hash: String,
+    pub language: String,
+    pub completed: Vec<DesignPart>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub draft_id: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesignPart {
+    pub document: crate::design_generation::GeneratedDocument,
+    pub content_hash: String,
+    pub source_run_id: String,
+    pub effective_settings: Value,
+    pub resolved_model: Option<String>,
+    pub cli_version: String,
+    pub created_at: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {

@@ -615,3 +615,114 @@ test('timeout settings use the new default only when the server value is absent'
     assert.equal(h.requests.filter(request=>request.options.method==='POST'||request.options.method==='PATCH').length,0);
   }finally{h.dispose();}
 });
+
+function stageFixture(session, count=3) {
+  const kinds=['drivers','quality_scenarios','alternatives','decisions','delivery','jobflow','state','screen_layout','navigation','architecture'];
+  return {id:'generation-1',input_revision:session.design_revision,input_hash:'input',contract_hash:'contract',language:'ko',draft_id:null,
+    completed:kinds.slice(0,count).map(kind=>({document:{kind,markdown:'<script>PARTIAL_MUST_NOT_RENDER</script>'},content_hash:kind,source_run_id:'previous-run'}))};
+}
+
+test('document stages show verified progress and explicit resume without publishing partial content',async()=>{
+  let session=sessionFixture();session.design_generations=[stageFixture(session)];
+  let run={id:'stage-failed',session_id:session.id,kind:'design',status:'failed',process_termination:'confirmed',progress:'문서 4/10 · 아키텍처 결정 기록',effective_settings:{timeout_seconds:1800},error:{code:'invalid_model_output',message:'Synthetic single document failure'}};
+  const original=structuredClone(session.messages);let release;
+  const h=harness(async(path,options,body)=>{
+    if(path==='/api/v1/workspace')return {project_name:'stage project',sessions:[session],runs:[run],active_run:run.status==='running'?run:null,exports:[],context_files:[]};
+    if(path.endsWith('/draft')&&options.method==='POST'){
+      assert.deepEqual(body.payload,{});assert.equal(body.expected_revision,4);
+      return new Promise(resolve=>{release=()=>{run={...run,id:'stage-resume',status:'running',error:null};session={...session,revision:5,active_run_id:run.id};resolve({session,run});};});
+    }
+    return path.includes('/runs/')?run:session;
+  });
+  try{
+    await eventually(()=>h.app.state.scene==='recovery');
+    let html=h.doc.getElementById('workspace-content').innerHTML;
+    assert.match(html,/문서 3\/10 완료/);assert.match(html,/남은 문서 이어 만들기/);assert.match(html,/처음부터 새로 생성/);
+    assert.doesNotMatch(html,/PARTIAL_MUST_NOT_RENDER|data-action="approve"|data-action="save-preview"/);
+    h.app.state.answer='아직 보내지 않은 설계 메모';h.click('generate');h.click('generate');
+    await eventually(()=>release);assert.equal(h.requests.filter(r=>r.path.endsWith('/draft')&&r.options.method==='POST').length,1);
+    release();await eventually(()=>h.app.state.scene==='generating'&&!h.app.state.busy);
+    html=h.doc.getElementById('workspace-content').innerHTML;
+    assert.match(html,/문서 3\/10 완료/);assert.match(html,/문서 4\/10 · 아키텍처 결정 기록/);assert.match(html,/요청당 시간 제한: 1800초 \(30분\)/);
+    assert.deepEqual(h.app.state.session.messages,original);assert.equal(h.app.state.answer,'아직 보내지 않은 설계 메모');
+  }finally{h.dispose();}
+});
+
+test('explicit document restart uses a new-generation payload and preserves messages and finished drafts',async()=>{
+  let session=sessionFixture();session.design_generations=[stageFixture(session)];
+  session.drafts=[{id:'old-draft',input_revision:session.design_revision,markdown:'# Finished earlier design',documents:[],reviewed:true,content_status:'draft'}];
+  const oldMessages=structuredClone(session.messages),oldDrafts=structuredClone(session.drafts);
+  let run={id:'failed-stage',session_id:session.id,kind:'design',status:'failed',process_termination:'confirmed',effective_settings:{timeout_seconds:1800}};
+  const h=harness(async(path,options,body)=>{
+    if(path==='/api/v1/workspace')return {project_name:'restart project',sessions:[session],runs:[run],active_run:run.status==='running'?run:null,exports:[],context_files:[]};
+    if(path.endsWith('/draft')&&options.method==='POST'){
+      assert.deepEqual(body.payload,{restart:true});
+      session={...session,revision:5,active_run_id:'restart-run',design_generations:[...session.design_generations,{...stageFixture(session,0),id:'new-generation'}]};
+      run={...run,id:'restart-run',status:'running'};return {session,run};
+    }
+    return path.includes('/runs/')?run:session;
+  });
+  try{
+    await eventually(()=>h.app.state.scene==='recovery');
+    assert.equal(h.requests.filter(r=>r.options.method==='POST').length,0);
+    h.click('restart-design');await eventually(()=>h.app.state.run?.id==='restart-run'&&!h.app.state.busy);
+    assert.equal(h.requests.filter(r=>r.options.method==='POST').length,1);
+    assert.deepEqual(h.app.state.session.messages,oldMessages);assert.deepEqual(h.app.state.session.drafts,oldDrafts);
+    assert.match(h.doc.getElementById('workspace-content').innerHTML,/문서 0\/10 완료/);
+  }finally{h.dispose();}
+});
+
+test('obsolete completed or unconfirmed document checkpoints cannot trigger a partial resume or restart',async()=>{
+  for(const mode of ['stale','language','completed','unknown']){
+    const session=sessionFixture(),checkpoint=stageFixture(session);session.design_generations=[checkpoint];
+    if(mode==='stale')checkpoint.input_revision--;
+    if(mode==='language')checkpoint.language='en';
+    if(mode==='completed')checkpoint.draft_id='done';
+    const run={id:'latest-design',session_id:session.id,kind:'design',status:'failed',process_termination:mode==='unknown'?'unknown':'confirmed'};
+    const h=harness(async path=>path==='/api/v1/workspace'?{project_name:'stale stage',sessions:[session],runs:[run],active_run:mode==='unknown'?run:null,exports:[],context_files:[]}:path.includes('/runs/')?run:session);
+    try{
+      await eventually(()=>h.app.state.scene==='recovery');const html=h.doc.getElementById('workspace-content').innerHTML;
+      if(mode!=='unknown')assert.doesNotMatch(html,/남은 문서 이어 만들기|문서 3\/10 완료/);
+      if(mode==='unknown'){h.click('restart-design');assert.equal(h.requests.filter(r=>r.options.method==='POST').length,0);assert.match(html,/수동 종료 확인/);}
+    }finally{h.dispose();}
+  }
+});
+
+test('fresh workspace language overrides an older settings dialog cache for document resume',async()=>{
+  const session=sessionFixture();session.design_generations=[stageFixture(session)];
+  const run={id:'failed-design',session_id:session.id,kind:'design',status:'failed',process_termination:'confirmed'};
+  const workspace={project_name:'language changed',settings:{...settings,documents:{...settings.documents,language:'en'}},settings_revision:5,sessions:[session],runs:[run],active_run:null,exports:[],context_files:[]};
+  const h=harness(async path=>path==='/api/v1/workspace'?workspace:path.includes('/runs/')?run:session);
+  try{
+    await eventually(()=>h.app.state.scene==='recovery');
+    h.app.state.settings=structuredClone(settings);h.app.state.settingsRevision=2;
+    await h.app.refresh({keep:false});
+    assert.doesNotMatch(h.doc.getElementById('workspace-content').innerHTML,/남은 문서 이어 만들기|문서 3\/10 완료/);
+    assert.equal(h.requests.filter(r=>r.options.method==='POST').length,0);
+  }finally{h.dispose();}
+});
+
+test('a whole-draft critic shows the generation belonging to its draft instead of a later partial design',async()=>{
+  const session=sessionFixture(),complete=stageFixture(session,10);complete.id='completed-generation';complete.draft_id='finished-draft';
+  session.design_generations=[complete,stageFixture(session)];
+  session.drafts=[{id:'finished-draft',input_revision:session.design_revision,markdown:'# Finished draft',documents:[],reviewed:false,content_status:'draft'}];
+  const run={id:'critic-running',session_id:session.id,kind:'critic',status:'running',process_termination:'pending',effective_settings:{timeout_seconds:1800}};
+  const h=harness(async path=>path==='/api/v1/workspace'?{project_name:'critic target',sessions:[session],runs:[run],active_run:run,exports:[],context_files:[]}:path.includes('/runs/')?run:session);
+  try{
+    await eventually(()=>h.app.state.run?.id===run.id);h.click('review');
+    assert.match(h.doc.getElementById('workspace-content').innerHTML,/문서 10\/10 완료/);
+    assert.doesNotMatch(h.doc.getElementById('workspace-content').innerHTML,/문서 3\/10 완료/);
+  }finally{h.dispose();}
+});
+
+test('document target stays visible when native CLI progress changes its generic message',async()=>{
+  const session=sessionFixture();session.design_generations=[stageFixture(session)];
+  const order=stageFixture(session,10).completed.map(part=>({kind:part.document.kind,title:part.document.kind,filename:'synthetic.md'}));order[3].title='아키텍처 결정 기록';
+  const run={id:'running-document',session_id:session.id,kind:'design',status:'running',process_termination:'pending',progress:'AI CLI를 시작합니다.',effective_settings:{timeout_seconds:1800}};
+  const h=harness(async path=>path==='/api/v1/workspace'?{project_name:'document target',document_generation_order:order,sessions:[session],runs:[run],active_run:run,exports:[],context_files:[]}:path.includes('/runs/')?run:session);
+  try{
+    await eventually(()=>h.app.state.run?.id===run.id);
+    assert.match(h.doc.getElementById('workspace-content').innerHTML,/현재 문서: 아키텍처 결정 기록/);
+    assert.match(h.doc.getElementById('workspace-content').innerHTML,/문서 3\/10 완료/);
+  }finally{h.dispose();}
+});

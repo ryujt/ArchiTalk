@@ -129,7 +129,7 @@ impl DocumentKind {
         }
     }
 
-    fn trace_prefix(self) -> Option<&'static str> {
+    pub(crate) fn trace_prefix(self) -> Option<&'static str> {
         match self {
             Self::Drivers => Some("DRV"),
             Self::QualityScenarios => Some("QA"),
@@ -158,10 +158,122 @@ fn invalid(detail: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("architecture design package: {detail}")
 }
 
+pub(crate) struct DocumentAnalysis {
+    pub lines: Vec<String>,
+    pub definitions: std::collections::HashMap<String, Vec<String>>,
+    pub references: Vec<String>,
+    pub anchors: std::collections::HashSet<String>,
+    pub links: Vec<String>,
+}
+
+/// The unchanged per-document contract shared by complete and staged generation.
+pub(crate) fn analyze_document(
+    kind: Option<DocumentKind>,
+    markdown: &str,
+) -> anyhow::Result<DocumentAnalysis> {
+    use crate::document_format::{DiagramKind, ValidationProfile, validate_profile};
+    let filename = kind.map_or(MAIN_FILENAME, DocumentKind::filename);
+    if markdown.trim().len() < 200 || markdown.len() > MAX_DOCUMENT_BYTES {
+        return Err(invalid(format!(
+            "{filename}: document must contain 200–150000 UTF-8 bytes"
+        )));
+    }
+    let profile = match kind {
+        None => ValidationProfile::Principal,
+        Some(DocumentKind::Navigation) => ValidationProfile::Diagram(DiagramKind::Navigation),
+        Some(DocumentKind::Jobflow) => ValidationProfile::Diagram(DiagramKind::Jobflow),
+        Some(DocumentKind::State) => ValidationProfile::Diagram(DiagramKind::State),
+        Some(DocumentKind::ScreenLayout) => ValidationProfile::Diagram(DiagramKind::Layout),
+        _ => ValidationProfile::Supporting,
+    };
+    validate_profile(markdown, profile).map_err(|error| invalid(format!("{filename}: {error}")))?;
+    let lines = crate::document_format::outline_lines(markdown)?;
+    let sections = kind.map_or(PRINCIPAL_SECTIONS, DocumentKind::required_sections);
+    for section in sections {
+        let heading = format!("## {section}");
+        let Some(start) = lines.iter().position(|line| line == &heading) else {
+            return Err(invalid(format!("{filename}: missing section: {section}")));
+        };
+        let content = lines[start + 1..]
+            .iter()
+            .take_while(|line| !line.starts_with("## "));
+        if !content
+            .into_iter()
+            .any(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        {
+            return Err(invalid(format!("{filename}: empty section: {section}")));
+        }
+    }
+    let mut definitions = std::collections::HashMap::new();
+    let mut own_definitions = 0;
+    for (index, line) in lines.iter().enumerate() {
+        let Some(title) = line.strip_prefix("### ") else {
+            continue;
+        };
+        let ids = trace_ids(title)?;
+        let Some(id) = ids.first().filter(|id| title.starts_with(id.as_str())) else {
+            continue;
+        };
+        let prefix = id.split_once('-').unwrap().0;
+        if kind.and_then(DocumentKind::trace_prefix) != Some(prefix) {
+            return Err(invalid(format!(
+                "{filename}: {id} must be defined in its owning document"
+            )));
+        }
+        let body: Vec<_> = lines[index + 1..]
+            .iter()
+            .take_while(|line| !line.starts_with("## ") && !line.starts_with("### "))
+            .cloned()
+            .collect();
+        if definitions.insert(id.clone(), body).is_some() {
+            return Err(invalid(format!("duplicate trace definition: {id}")));
+        }
+        own_definitions += 1;
+    }
+    if kind.and_then(DocumentKind::trace_prefix).is_some() && own_definitions == 0 {
+        return Err(invalid(format!(
+            "{filename}: real level-three trace definitions required"
+        )));
+    }
+    let references = trace_ids(&lines.join("\n"))?;
+    for (id, body) in &definitions {
+        let references = trace_ids(&body.join("\n"))?;
+        for prefix in required_trace_prefixes(id) {
+            if !references
+                .iter()
+                .any(|value| value.starts_with(&format!("{prefix}-")))
+            {
+                return Err(invalid(format!(
+                    "{filename}: {id} needs a {prefix} reference in its record"
+                )));
+            }
+        }
+    }
+    let anchors = heading_anchors(&lines);
+    let links = markdown_targets(&lines.join("\n"));
+    Ok(DocumentAnalysis {
+        lines,
+        definitions,
+        references,
+        anchors,
+        links,
+    })
+}
+
+fn required_trace_prefixes(id: &str) -> &'static [&'static str] {
+    match id.split_once('-').unwrap().0 {
+        "DRV" => &["QA", "ADR"],
+        "QA" => &["DRV"],
+        "ALT" => &["DRV", "QA"],
+        "ADR" => &["DRV", "QA", "ALT"],
+        "VAL" => &["QA", "ADR"],
+        _ => unreachable!(),
+    }
+}
+
 /// Structural checks for newly generated packages. Semantic quality remains a
 /// separate independent review of the complete, unabridged package.
 pub fn validate(mut package: DesignPackage) -> anyhow::Result<DesignPackage> {
-    use crate::document_format::{DiagramKind, ValidationProfile, validate_profile};
     use std::collections::{HashMap, HashSet};
 
     if package.documents.len() != DocumentKind::ALL.len() {
@@ -197,69 +309,13 @@ pub fn validate(mut package: DesignPackage) -> anyhow::Result<DesignPackage> {
                 .map(|d| (Some(d.kind), d.kind.filename(), d.markdown.as_str())),
         )
     {
-        if markdown.trim().len() < 200 || markdown.len() > MAX_DOCUMENT_BYTES {
-            return Err(invalid(format!(
-                "{filename}: document must contain 200–150000 UTF-8 bytes"
-            )));
-        }
-        let profile = match kind {
-            None => ValidationProfile::Principal,
-            Some(DocumentKind::Navigation) => ValidationProfile::Diagram(DiagramKind::Navigation),
-            Some(DocumentKind::Jobflow) => ValidationProfile::Diagram(DiagramKind::Jobflow),
-            Some(DocumentKind::State) => ValidationProfile::Diagram(DiagramKind::State),
-            Some(DocumentKind::ScreenLayout) => ValidationProfile::Diagram(DiagramKind::Layout),
-            _ => ValidationProfile::Supporting,
-        };
-        validate_profile(markdown, profile)
-            .map_err(|error| invalid(format!("{filename}: {error}")))?;
-        let lines = crate::document_format::outline_lines(markdown)?;
-        let sections = kind.map_or(PRINCIPAL_SECTIONS, DocumentKind::required_sections);
-        for section in sections {
-            let heading = format!("## {section}");
-            let Some(start) = lines.iter().position(|line| line == &heading) else {
-                return Err(invalid(format!("{filename}: missing section: {section}")));
-            };
-            let content = lines[start + 1..]
-                .iter()
-                .take_while(|line| !line.starts_with("## "));
-            if !content
-                .into_iter()
-                .any(|line| !line.trim().is_empty() && !line.starts_with('#'))
-            {
-                return Err(invalid(format!("{filename}: empty section: {section}")));
-            }
-        }
-        let mut own_definitions = 0;
-        for (index, line) in lines.iter().enumerate() {
-            let Some(title) = line.strip_prefix("### ") else {
-                continue;
-            };
-            let ids = trace_ids(title)?;
-            let Some(id) = ids.first().filter(|id| title.starts_with(id.as_str())) else {
-                continue;
-            };
-            let prefix = id.split_once('-').unwrap().0;
-            if kind.and_then(DocumentKind::trace_prefix) != Some(prefix) {
-                return Err(invalid(format!(
-                    "{filename}: {id} must be defined in its owning document"
-                )));
-            }
-            let body: Vec<_> = lines[index + 1..]
-                .iter()
-                .take_while(|line| !line.starts_with("## ") && !line.starts_with("### "))
-                .cloned()
-                .collect();
+        let analysis = analyze_document(kind, markdown)?;
+        for (id, body) in analysis.definitions {
             if definitions.insert(id.clone(), (filename, body)).is_some() {
                 return Err(invalid(format!("duplicate trace definition: {id}")));
             }
-            own_definitions += 1;
         }
-        if kind.and_then(DocumentKind::trace_prefix).is_some() && own_definitions == 0 {
-            return Err(invalid(format!(
-                "{filename}: real level-three trace definitions required"
-            )));
-        }
-        outlines.insert(filename, lines);
+        outlines.insert(filename, analysis.lines);
     }
     for (filename, lines) in &outlines {
         for id in trace_ids(&lines.join("\n"))? {
@@ -271,14 +327,7 @@ pub fn validate(mut package: DesignPackage) -> anyhow::Result<DesignPackage> {
         }
     }
     for (id, (filename, body)) in &definitions {
-        let required: &[&str] = match id.split_once('-').unwrap().0 {
-            "DRV" => &["QA", "ADR"],
-            "QA" => &["DRV"],
-            "ALT" => &["DRV", "QA"],
-            "ADR" => &["DRV", "QA", "ALT"],
-            "VAL" => &["QA", "ADR"],
-            _ => unreachable!(),
-        };
+        let required = required_trace_prefixes(id);
         let references = trace_ids(&body.join("\n"))?;
         for prefix in required {
             if !references

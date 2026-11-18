@@ -16,7 +16,7 @@ use std::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 pub const RESET_CODE: &str = "workspace_reset_required";
 pub const RESET_MESSAGE: &str = ".architalk가 삭제되거나 교체되어 이전 상태를 더 사용하지 않습니다. 서버를 종료하고 이 프로젝트에서 다시 시작하세요.";
 
@@ -214,6 +214,7 @@ fn sqlite_owned_filename(name: &[u8]) -> bool {
     let Some(uuid) = base
         .strip_prefix(b"workspace.pre-v1-")
         .or_else(|| base.strip_prefix(b"workspace.pre-v2-"))
+        .or_else(|| base.strip_prefix(b"workspace.pre-v3-"))
         .and_then(|value| value.strip_suffix(b".db"))
         .and_then(|value| std::str::from_utf8(value).ok())
     else {
@@ -423,15 +424,15 @@ impl Store {
             tx.execute_batch("CREATE TABLE workspace (id INTEGER PRIMARY KEY CHECK(id=1), snapshot TEXT NOT NULL);
                 CREATE TABLE receipts (command_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, response TEXT NOT NULL);
                 CREATE TABLE events (cursor INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL);
-                CREATE INDEX events_by_session ON events(session_id,cursor);
-                PRAGMA user_version=2;")?;
+                CREATE INDEX events_by_session ON events(session_id,cursor);")?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
-        } else if version == 1 {
-            // v1 readers ignore unknown JSON fields, so they must refuse v2
-            // before they can discard a package's supporting documents.
-            backup_before_migration(&connection, &state, 2)?;
+        } else if version < SCHEMA_VERSION {
+            // Older readers ignore unknown JSON fields and could discard the
+            // per-document generation checkpoints on their next write.
+            backup_before_migration(&connection, &state, SCHEMA_VERSION)?;
             let tx = connection.transaction()?;
-            tx.execute_batch("PRAGMA user_version=2;")?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
         connection.pragma_update(None, "journal_mode", "DELETE")?;

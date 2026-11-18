@@ -41,5 +41,8 @@
 | 설계 시간 제한·기본값·실제 프로세스 종료 | [timeout-backend](timeout-backend-20261118.md) | 상한3600/기본1800, 집중20 통과·유료1 제외, 최초 반례 실패 보존 |
 | 시간 초과 안내·설정 조정·초안 재생성 | [timeout-ui](timeout-ui-20261118.md) | Node38·실제10초 timeout/복구와 설정 browser4 통과 |
 | 기존 기록·명시 설정 보존·최종 조립 | [timeout-integration](timeout-integration-20261118.md) | Rust149·Node38·browser4·전역0.2.3 통과 |
+| 문서별 응답·prefix·미래 ID·전체 조립 계약 | [document-stages-domain](document-stages-domain-20261118.md) | 단위/기존 계약47 통과, 최초 반례와 수정 보존 |
+| 순차 요청·DB 진행·재개·취소·최종 검증 | [document-stages-app](document-stages-app-20261118.md) | 소비자25·guard·강화2 표적 및 clippy 통과 |
+| 단계 진행 UI·schema3·전체 조립·설치 | [document-stages-integration](document-stages-integration-20261118.md) | Node44·Rust168·browser22·migration/구 바이너리·전역0.3.0 통과 |
 
 최초 작업으로 참고할 이전 실행은 없었다. 후속 실행은 각 기록의 미검증·후속 조건을 먼저 확인한다.

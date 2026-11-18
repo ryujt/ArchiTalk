@@ -58,6 +58,13 @@ async function startServer() {
   };
   return {
     ...endpoint,project,
+    async configureDocumentStages({failKind=null,holdKind=null}={}){
+      const kinds=['drivers','quality_scenarios','alternatives','decisions','delivery','jobflow','state','screen_layout','navigation','architecture'];
+      if([failKind,holdKind].some(kind=>kind!==null&&!kinds.includes(kind)))throw new Error('Unknown isolated document generation kind.');
+      const control=join(tools,'stage-control.json');
+      await writeFile(`${control}.tmp`,JSON.stringify({fail_kind:failKind,hold_kind:holdKind}));
+      await rename(`${control}.tmp`,control);
+    },
     async configureDesignDelay(seconds,{hold=false}={}){
       if(!Number.isFinite(seconds)||seconds<0||seconds>30||typeof hold!=='boolean')throw new Error('Invalid isolated design delay.');
       // Atomic parent writes; the child reads only this test-owned input.

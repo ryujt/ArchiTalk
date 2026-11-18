@@ -2,6 +2,7 @@
 use crate::{
     ai,
     config::{self, Settings},
+    design_generation::{self, GeneratedDocument, GenerationKind},
     design_package::{DesignDocument, DocumentKind, MAIN_FILENAME, package_hash},
     domain, files,
     model::*,
@@ -74,6 +75,7 @@ struct Launch {
     session: Session,
     spec: ai::RunSpec,
     cancel: CancellationToken,
+    generation_id: Option<String>,
 }
 
 impl App {
@@ -210,8 +212,12 @@ impl App {
                 .into_iter()
                 .map(|kind| json!({"kind":kind,"filename":kind.filename(),"title":kind.title()})),
         );
+        let document_generation_order: Vec<_> = GenerationKind::ALL
+            .into_iter()
+            .map(|kind| json!({"kind":kind,"title":kind.title(),"filename":kind.filename()}))
+            .collect();
         Ok(
-            json!({"project_name":self.root.file_name().unwrap_or_default().to_string_lossy(),"root_display":self.root.display().to_string(),"sessions":i.state.sessions,"settings":i.state.settings,"settings_revision":i.state.settings_revision,"workspace_revision":i.state.workspace_revision,"context_files":scan.files,"document_types":document_types,"active_run":active_run(&i.state),"runs":i.state.runs,"exports":i.state.exports,"latest_run":i.state.runs.last(),"cursor":i.store.latest_cursor()?}),
+            json!({"project_name":self.root.file_name().unwrap_or_default().to_string_lossy(),"root_display":self.root.display().to_string(),"sessions":i.state.sessions,"settings":i.state.settings,"settings_revision":i.state.settings_revision,"workspace_revision":i.state.workspace_revision,"context_files":scan.files,"document_types":document_types,"document_generation_order":document_generation_order,"active_run":active_run(&i.state),"runs":i.state.runs,"exports":i.state.exports,"latest_run":i.state.runs.last(),"cursor":i.store.latest_cursor()?}),
         )
     }
     pub fn session(&self, id: &str) -> Result<Value> {
@@ -638,7 +644,28 @@ impl App {
                         if kind == "critic" && s.drafts.is_empty() {
                             return Err(AppError::new("no_draft", "검토할 초안을 먼저 만드세요."));
                         }
-                        let l = prepare_run(s, &mut next.runs, &next.settings, kind, &self.root)?;
+                        let restart = if kind == "design" {
+                            match command.payload.get("restart") {
+                                None => false,
+                                Some(Value::Bool(value)) => *value,
+                                Some(_) => {
+                                    return Err(AppError::new(
+                                        "invalid_input",
+                                        "restart는 true 또는 false여야 합니다.",
+                                    ));
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        let l = prepare_run_options(
+                            s,
+                            &mut next.runs,
+                            &next.settings,
+                            kind,
+                            &self.root,
+                            restart,
+                        )?;
                         let response = json!({"session":s,"run":next.runs.last()});
                         launch = Some(l);
                         response
@@ -983,8 +1010,12 @@ impl App {
                 .unwrap_or_default()
         };
         tracing::info!(run_id=%l.run_id,role=%kind,phase="ai_start","run phase");
-        let spec = l.spec;
-        let mut result = ai::generate(spec.clone(), l.cancel.clone(), tx.clone()).await;
+        let spec = l.spec.clone();
+        let mut result = if kind == "design" {
+            self.execute_design(&l, tx.clone()).await
+        } else {
+            ai::generate(spec.clone(), l.cancel.clone(), tx.clone()).await
+        };
         if self.ensure_workspace_current().is_err() {
             drop(tx);
             let _ = forward.await;
@@ -1010,7 +1041,7 @@ impl App {
         drop(tx);
         let _ = forward.await;
         tracing::info!(run_id=%l.run_id,phase="drain_complete","run phase");
-        let outcome = self.complete(&l.run_id, &kind, result);
+        let outcome = self.complete(&l.run_id, &kind, l.generation_id.as_deref(), result);
         if let Err(e) = outcome {
             tracing::error!(run_id=%l.run_id,error=%e.message,"run completion failed");
             self.fail_completion(&l.run_id, &e.message);
@@ -1018,10 +1049,132 @@ impl App {
             tracing::info!(run_id=%l.run_id,phase="committed","run phase");
         }
     }
+    async fn execute_design(
+        &self,
+        launch: &Launch,
+        events: mpsc::Sender<ai::AiEvent>,
+    ) -> std::result::Result<ai::AiOutput, ai::AiError> {
+        loop {
+            let checkpoint = {
+                let inner = self.checked_lock().map_err(design_error)?;
+                let (session, _, generation) =
+                    checked_generation(&inner.state, launch).map_err(design_error)?;
+                inner.state.sessions[session].design_generations[generation].clone()
+            };
+            let completed = checkpoint_documents(&checkpoint);
+            let Some(kind) = GenerationKind::ALL.get(completed.len()).copied() else {
+                let package = design_generation::assemble(&completed)
+                    .map_err(|error| invalid_design_output(None, error))?;
+                let last = checkpoint
+                    .completed
+                    .last()
+                    .expect("a complete package has documents");
+                return Ok(ai::AiOutput {
+                    text: serde_json::to_string(&package)
+                        .map_err(|error| invalid_design_output(None, error))?,
+                    cli_version: last.cli_version.clone(),
+                    resolved_model: last.resolved_model.clone(),
+                });
+            };
+            self.begin_design_document(launch, kind)
+                .map_err(design_error)?;
+            let mut request = launch.spec.clone();
+            request.prompt = domain::prompt_design_document(
+                &launch.session,
+                kind,
+                &completed,
+                &checkpoint.language,
+            )
+            .map_err(|error| invalid_design_output(Some(kind), error))?;
+            {
+                let inner = self.checked_lock().map_err(design_error)?;
+                checked_generation(&inner.state, launch).map_err(design_error)?;
+            }
+            let output = ai::generate(request, launch.cancel.clone(), events.clone()).await?;
+            let document = design_generation::validate_response(&output.text, kind, &completed)
+                .map_err(|error| invalid_design_output(Some(kind), error))?;
+            self.commit_design_document(launch, document, output)
+                .map_err(design_error)?;
+        }
+    }
+
+    fn begin_design_document(&self, launch: &Launch, kind: GenerationKind) -> Result<()> {
+        let mut inner = self.checked_lock()?;
+        let (session, run, generation) = checked_generation(&inner.state, launch)?;
+        let mut next = inner.state.clone();
+        let checkpoint = &next.sessions[session].design_generations[generation];
+        let completed = checkpoint.completed.len();
+        if GenerationKind::ALL.get(completed) != Some(&kind) {
+            return Err(AppError::new(
+                "stale_input",
+                "설계 문서 순서가 변경되었습니다.",
+            ));
+        }
+        let generation_id = checkpoint.id.clone();
+        next.runs[run].progress = format!("{} 생성 중 · {completed}/10 완료", kind.filename());
+        next.sessions[session].revision += 1;
+        let event = inner.store.commit_workspace(&serde_json::to_value(&next)?, None, Some(EventInput {
+            session_id: Some(launch.session.id.clone()), kind: "design_document_started".into(),
+            payload: json!({"run_id":launch.run_id,"generation_id":generation_id,"kind":kind.as_str(),"filename":kind.filename(),"completed":completed,"total":10}),
+        }))?;
+        inner.state = next;
+        drop(inner);
+        if let Some(event) = event {
+            self.publish_record(event);
+        }
+        Ok(())
+    }
+
+    fn commit_design_document(
+        &self,
+        launch: &Launch,
+        document: GeneratedDocument,
+        output: ai::AiOutput,
+    ) -> Result<()> {
+        let mut inner = self.checked_lock()?;
+        let (session, run, generation) = checked_generation(&inner.state, launch)?;
+        let mut next = inner.state.clone();
+        let checkpoint = &mut next.sessions[session].design_generations[generation];
+        let kind = document.kind;
+        if GenerationKind::ALL.get(checkpoint.completed.len()) != Some(&kind) {
+            return Err(AppError::new(
+                "stale_input",
+                "설계 문서 순서가 변경되었습니다.",
+            ));
+        }
+        checkpoint.completed.push(DesignPart {
+            content_hash: hash(&document.markdown),
+            document,
+            source_run_id: launch.run_id.clone(),
+            effective_settings: next.runs[run].effective_settings.clone(),
+            resolved_model: output.resolved_model.clone(),
+            cli_version: output.cli_version.clone(),
+            created_at: now(),
+        });
+        checkpoint.updated_at = now();
+        let completed = checkpoint.completed.len();
+        let generation_id = checkpoint.id.clone();
+        next.runs[run].progress = format!("{} 완료 · {completed}/10 완료", kind.filename());
+        next.runs[run].resolved_model = output.resolved_model;
+        next.runs[run].cli_version = Some(output.cli_version);
+        next.sessions[session].revision += 1;
+        let event = inner.store.commit_workspace(&serde_json::to_value(&next)?, None, Some(EventInput {
+            session_id: Some(launch.session.id.clone()), kind: "design_document_completed".into(),
+            payload: json!({"run_id":launch.run_id,"generation_id":generation_id,"kind":kind.as_str(),"filename":kind.filename(),"completed":completed,"total":10}),
+        }))?;
+        inner.state = next;
+        drop(inner);
+        if let Some(event) = event {
+            self.publish_record(event);
+        }
+        Ok(())
+    }
+
     fn complete(
         self: &Arc<Self>,
         rid: &str,
         kind: &str,
+        generation_id: Option<&str>,
         result: std::result::Result<ai::AiOutput, ai::AiError>,
     ) -> Result<()> {
         let mut i = self.checked_lock()?;
@@ -1034,7 +1187,19 @@ impl App {
         let sid = next.runs[rpos].session_id.clone();
         let spos = next.sessions.iter().position(|s| s.id == sid).unwrap();
         let cancelled = next.runs[rpos].status == "cancelling";
-        let stale = next.sessions[spos].design_revision != next.runs[rpos].input_revision;
+        let mut stale = next.sessions[spos].design_revision != next.runs[rpos].input_revision;
+        if kind == "design" {
+            stale |= next.sessions[spos]
+                .design_generations
+                .last()
+                .is_none_or(|checkpoint| {
+                    Some(checkpoint.id.as_str()) != generation_id
+                        || checkpoint.draft_id.is_some()
+                        || checkpoint.input_revision != next.sessions[spos].design_revision
+                        || domain::design_context_hash(&next.sessions[spos], &checkpoint.language)
+                            .map_or(true, |value| value != checkpoint.input_hash)
+                });
+        }
         let mut launch = None;
         match result {
             Ok(out) if !cancelled && !stale => {
@@ -1053,6 +1218,10 @@ impl App {
                             content_status: "draft".into(),
                             reviewed: false,
                         };
+                        if let Some(checkpoint) = s.design_generations.last_mut() {
+                            checkpoint.draft_id = Some(d.id.clone());
+                            checkpoint.updated_at = now();
+                        }
                         s.drafts.push(d);
                         s.content_status = "draft".into();
                     }),
@@ -1081,6 +1250,8 @@ impl App {
             Err(e) => {
                 next.runs[rpos].status = if cancelled || e.code == "cancelled" {
                     "cancelled"
+                } else if stale || e.code == "stale_input" {
+                    "stale"
                 } else {
                     "failed"
                 }
@@ -1300,7 +1471,56 @@ fn prepare_run(
     kind: &str,
     root: &Path,
 ) -> Result<Launch> {
-    let prompt = domain::prompt(s, kind, &settings.documents.language)?;
+    prepare_run_options(s, runs, settings, kind, root, false)
+}
+fn prepare_run_options(
+    s: &mut Session,
+    runs: &mut Vec<Run>,
+    settings: &Settings,
+    kind: &str,
+    root: &Path,
+    restart: bool,
+) -> Result<Launch> {
+    let language = &settings.documents.language;
+    let generation_id = if kind == "design" {
+        let input_hash = domain::design_context_hash(s, language)?;
+        let contract_hash = design_generation::contract_hash();
+        let reusable = !restart
+            && s.design_generations.last().is_some_and(|checkpoint| {
+                checkpoint.draft_id.is_none()
+                    && checkpoint.input_revision == s.design_revision
+                    && checkpoint.input_hash == input_hash
+                    && checkpoint.contract_hash == contract_hash
+                    && checkpoint.language == *language
+                    && checkpoint_valid(checkpoint)
+            });
+        if !reusable {
+            let created_at = now();
+            s.design_generations.push(DesignCheckpoint {
+                id: id(),
+                input_revision: s.design_revision,
+                input_hash,
+                contract_hash,
+                language: language.clone(),
+                completed: vec![],
+                created_at: created_at.clone(),
+                updated_at: created_at,
+                draft_id: None,
+            });
+        }
+        Some(s.design_generations.last().unwrap().id.clone())
+    } else {
+        None
+    };
+    let prompt = if kind == "design" {
+        let completed = checkpoint_documents(s.design_generations.last().unwrap());
+        match GenerationKind::ALL.get(completed.len()) {
+            Some(target) => domain::prompt_design_document(s, *target, &completed, language)?,
+            None => String::new(),
+        }
+    } else {
+        domain::prompt(s, kind, language)?
+    };
     let spec = settings.run_spec(kind, prompt, root.to_owned());
     let rid = id();
     s.active_run_id = Some(rid.clone());
@@ -1313,7 +1533,7 @@ fn prepare_run(
         input_revision: s.design_revision,
         created_at: now(),
         completed_at: None,
-        effective_settings: domain::effective_summary(&spec),
+        effective_settings: run_effective_summary(&spec, kind),
         error: None,
         process_termination: "pending".into(),
         progress: "AI CLI를 시작합니다.".into(),
@@ -1325,7 +1545,94 @@ fn prepare_run(
         session: s.clone(),
         spec,
         cancel: CancellationToken::new(),
+        generation_id,
     })
+}
+
+fn checkpoint_documents(checkpoint: &DesignCheckpoint) -> Vec<GeneratedDocument> {
+    checkpoint
+        .completed
+        .iter()
+        .map(|part| part.document.clone())
+        .collect()
+}
+fn run_effective_summary(spec: &ai::RunSpec, kind: &str) -> Value {
+    let mut summary = domain::effective_summary(spec);
+    if kind == "design" {
+        summary["prompt_version"] = json!(design_generation::VERSION);
+        summary["generation_protocol"] = json!(design_generation::VERSION);
+        summary["generation_contract_hash"] = json!(design_generation::contract_hash());
+    }
+    summary
+}
+fn checkpoint_valid(checkpoint: &DesignCheckpoint) -> bool {
+    checkpoint
+        .completed
+        .iter()
+        .all(|part| part.content_hash == hash(&part.document.markdown))
+        && design_generation::validate_prefix(&checkpoint_documents(checkpoint)).is_ok()
+}
+fn checked_generation(workspace: &Workspace, launch: &Launch) -> Result<(usize, usize, usize)> {
+    let session = workspace
+        .sessions
+        .iter()
+        .position(|value| value.id == launch.session.id)
+        .ok_or_else(|| AppError::new("stale_input", "설계 대화가 변경되었습니다."))?;
+    let run = workspace
+        .runs
+        .iter()
+        .position(|value| value.id == launch.run_id)
+        .ok_or_else(|| AppError::new("stale_input", "설계 작업이 변경되었습니다."))?;
+    let active = &workspace.runs[run];
+    if launch.cancel.is_cancelled() || active.status == "cancelling" {
+        return Err(AppError::new("cancelled", "설계 생성을 중지했습니다."));
+    }
+    let value = &workspace.sessions[session];
+    let generation = value
+        .design_generations
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| AppError::new("stale_input", "설계 체크포인트가 없습니다."))?;
+    let checkpoint = &value.design_generations[generation];
+    let original = launch.session.design_generations.last().unwrap();
+    if active.status != "running"
+        || value.active_run_id.as_deref() != Some(&launch.run_id)
+        || Some(checkpoint.id.as_str()) != launch.generation_id.as_deref()
+        || checkpoint.draft_id.is_some()
+        || active.input_revision != value.design_revision
+        || checkpoint.input_revision != value.design_revision
+        || checkpoint.input_hash != original.input_hash
+        || checkpoint.contract_hash != original.contract_hash
+        || checkpoint.language != original.language
+        || domain::design_context_hash(value, &checkpoint.language)? != checkpoint.input_hash
+        || !checkpoint_valid(checkpoint)
+    {
+        return Err(AppError::new(
+            "stale_input",
+            "설계 입력 또는 체크포인트가 변경되었습니다.",
+        ));
+    }
+    Ok((session, run, generation))
+}
+fn design_error(error: AppError) -> ai::AiError {
+    ai::AiError {
+        code: error.code,
+        message: error.message,
+        termination_unknown: false,
+    }
+}
+fn invalid_design_output(
+    kind: Option<GenerationKind>,
+    error: impl std::fmt::Display,
+) -> ai::AiError {
+    ai::AiError {
+        code: "invalid_model_output".into(),
+        message: match kind {
+            Some(kind) => format!("{}: {error}", kind.filename()),
+            None => error.to_string(),
+        },
+        termination_unknown: false,
+    }
 }
 impl From<serde_json::Error> for AppError {
     fn from(e: serde_json::Error) -> Self {
@@ -1340,4 +1647,43 @@ fn file_outcome(result: anyhow::Result<files::ExportResult>) -> files::ExportRes
         files: vec![],
         error: Some(error.to_string()),
     })
+}
+
+#[cfg(test)]
+mod generation_gate_tests {
+    use super::*;
+
+    #[test]
+    fn source_changes_without_a_revision_and_cancelled_launches_cannot_commit_documents() {
+        let settings = Settings::default();
+        let mut workspace = Workspace::new(settings.clone());
+        let mut session = domain::new_session(
+            "synthetic stage gate".into(),
+            "Read a local resource".into(),
+            vec![],
+        );
+        let launch = prepare_run(
+            &mut session,
+            &mut workspace.runs,
+            &settings,
+            "design",
+            Path::new("."),
+        )
+        .unwrap();
+        workspace.sessions.push(session);
+        assert!(checked_generation(&workspace, &launch).is_ok());
+        let original = workspace.sessions[0].messages[0].content.clone();
+        workspace.sessions[0].messages[0].content =
+            "A different source without a bookkeeping revision".into();
+        assert_eq!(
+            checked_generation(&workspace, &launch).unwrap_err().code,
+            "stale_input"
+        );
+        workspace.sessions[0].messages[0].content = original;
+        launch.cancel.cancel();
+        assert_eq!(
+            checked_generation(&workspace, &launch).unwrap_err().code,
+            "cancelled"
+        );
+    }
 }
