@@ -37,10 +37,12 @@ export function createApi(token, fetcher = globalThis.fetch) {
     const headers = new Headers(options.headers || {});
     headers.set('Authorization', `Bearer ${token}`);
     headers.set('Accept', options.stream ? 'text/event-stream' : 'application/json');
-    if (options.body !== undefined) headers.set('Content-Type', 'application/json');
+    const multipart = typeof FormData !== 'undefined' && options.body instanceof FormData;
+    if (multipart) headers.delete('Content-Type');
+    if (options.body !== undefined && !multipart) headers.set('Content-Type', 'application/json');
     const response = await fetcher(path, {
       method: options.method || 'GET', headers, signal: options.signal,
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      body: options.body === undefined ? undefined : multipart ? options.body : JSON.stringify(options.body),
       credentials: 'same-origin', mode: 'same-origin', redirect: 'error', cache: 'no-store'
     });
     if (options.stream && response.ok) {
@@ -218,12 +220,18 @@ export function startWorkspace(doc = document, win = window) {
     connection: 'connecting', modal: null, modalError: '', settings: null,
     diagnostics: null, choices: {}, settingsRevision: null, plan: null, saved: null,
     answer: '', intro: '', cursor: '', feed: null, refreshTimer: null, diagnosticTimer: null,
+    leftCollapsed: Boolean(win.matchMedia?.('(max-width:1030px)').matches),
+    rightCollapsed: Boolean(win.matchMedia?.('(max-width:760px)').matches),
+    fileTabActive: false,
     contextPaths: new Set(),
     refreshPromise: null, requestEpoch: 0, dialogFocus: null, dialogFocusAction: null,
     restoreFocus: false, dialogScroll: null, runScene: 'interview', disposed: false
   };
   let renderedScene = null, renderedConversation = null, followConversation = false;
   let documentPreview = null, documentRenderer = null;
+  let fileWorkspace=null, documentRecorder=null, viewerMenu=null, viewerPromise=null;
+  let transcriptionDialog=null, transcriptionEpoch=0, transcriptionRequest=null;
+  let lastReading='';
   const dialog = $('scene-dialog');
   const draft = () => list(state.session?.drafts).find(d => d.id === state.selectedDraft) || list(state.session?.drafts).at(-1);
   const availableDocuments = () => documentsForDraft(state.workspace, draft());
@@ -275,6 +283,7 @@ export function startWorkspace(doc = document, win = window) {
 
   function clearProjectView(workspace = null) {
     state.requestEpoch++; state.workspaceEpoch++;
+    documentRecorder?.clear();viewerMenu?.clear();clearTranscriptionDialog();fileWorkspace?.clear();state.fileTabActive=false;
     state.feed?.abort(); state.feed = null;
     win.clearTimeout(state.refreshTimer); state.refreshTimer = null;
     win.clearTimeout(state.diagnosticTimer); state.diagnosticTimer = null;
@@ -370,6 +379,7 @@ export function startWorkspace(doc = document, win = window) {
       state.error = null;
       render();
       ensureFeed();
+      void ensureFileWorkspace();
     })().finally(() => { state.refreshPromise = null; });
     return state.refreshPromise;
   }
@@ -477,6 +487,8 @@ export function startWorkspace(doc = document, win = window) {
 
   async function selectSession(id) {
     if (state.busy || state.connectionBlocked) return;
+    fileWorkspace?.showChat();
+    if(win.matchMedia?.('(max-width:1030px)').matches){state.leftCollapsed=true;renderPanels();}
     state.requestEpoch++;
     state.feed?.abort(); state.feed = null; state.cursor = ''; state.run = null;
     state.selectedDraft = null; state.selectedDocument = 'architecture'; state.documentAnchor = null; state.answer = ''; state.error = null; state.saved=null; state.lastExport=null;
@@ -490,11 +502,12 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function render() {
+    renderPanels();
     let scroll = {left: win.scrollX, top: win.scrollY, behavior: 'instant'};
     const scene = state.scene === 'generating' ? state.runScene : state.scene;
     const messages = list(state.session?.messages);
     const conversation = JSON.stringify([state.session?.id, messages.length, messages.at(-1)?.id, runIsActive(state.run) ? state.run.id : null]);
-    if (scene === 'interview') {
+    if (scene === 'interview' && !state.fileTabActive) {
       if (scene !== renderedScene || conversation !== renderedConversation) followConversation = true;
     } else followConversation = false;
     renderedScene = scene; renderedConversation = conversation;
@@ -513,13 +526,13 @@ export function startWorkspace(doc = document, win = window) {
     const focused = doc.activeElement;
     const editing = focused?.id === 'answer-input' || focused?.id === 'project-intro';
     const selection = editing ? [focused.selectionStart, focused.selectionEnd] : null;
-    content.innerHTML = renderStage();
-    renderDocumentPreview(content);
-    if (editing) {
+    if(!state.fileTabActive){content.innerHTML = renderStage();renderDocumentPreview(content);}
+    if (editing && !state.fileTabActive) {
       const replacement = $(focused.id);
       if (replacement) { replacement.focus({preventScroll: true}); replacement.setSelectionRange(...selection); }
     }
     renderAux();
+    renderRecorderControls();
     if (state.connectionBlocked) for (const control of doc.querySelectorAll?.('button,select,input,textarea') || []) control.disabled = true;
     if (state.modal) renderModal();
     if (state.restoreFocus && !state.modal) {
@@ -539,6 +552,15 @@ export function startWorkspace(doc = document, win = window) {
       // reading older messages during a snapshot or modal update.
       win.scrollTo?.(scroll);
     }
+  }
+
+  function renderPanels() {
+    doc.body.classList.toggle('left-panel-collapsed',state.leftCollapsed);
+    doc.body.classList.toggle('right-panel-collapsed',state.rightCollapsed);
+    $('sidebar-toggle')?.setAttribute('aria-expanded',String(!state.leftCollapsed));
+    $('sidebar-toggle')?.setAttribute('title',state.leftCollapsed?'프로젝트 패널 펼치기':'프로젝트 패널 접기');
+    $('info-toggle')?.setAttribute('aria-expanded',String(!state.rightCollapsed));
+    $('info-toggle')?.setAttribute('title',state.rightCollapsed?'설계 메모 펼치기':'설계 메모 접기');
   }
 
   function renderDocumentPreview(content) {
@@ -590,7 +612,8 @@ export function startWorkspace(doc = document, win = window) {
   }
 
   function inDocumentPreview(target) {
-    return target.closest?.('[data-document-preview]')?.dataset?.documentPreview !== undefined;
+    const preview=target.closest?.('[data-document-preview],[data-file-preview]');
+    return preview?.dataset?.documentPreview!==undefined || preview?.dataset?.filePreview!==undefined;
   }
 
   function renderSessions() {
@@ -757,6 +780,7 @@ export function startWorkspace(doc = document, win = window) {
     return `${header('미정인 조건 보류하기')}<div class="dialog-body"><p>${esc(coverage?.title)} · 결정하지 않은 내용은 미정으로 남겨요. 담당과 다음 확인을 함께 기록해 주세요.</p><div id="modal-error">${modalError()}</div><form id="coverage-form"><div class="form-field"><label for="coverage-reason">지금 보류하는 이유</label><input id="coverage-reason" name="reason" required maxlength="2000" value="${esc(coverage?.reason || '')}"></div><div class="form-field"><label for="coverage-owner">확인할 담당</label><input id="coverage-owner" name="owner" required maxlength="200" value="${esc(coverage?.owner || '')}"></div><div class="form-field"><label for="coverage-follow-up">언제 무엇을 확인할지</label><input id="coverage-follow-up" name="follow_up" required maxlength="2000" value="${esc(coverage?.follow_up || '')}"></div><div class="dialog-footer">${button('close-modal','취소','quiet-button')}<button type="submit" class="primary">보류 조건 기록</button></div></form></div>`;
   }
   function renderModal() {
+    dialog.classList.toggle('save-dialog',state.modal==='save');
     // Preserve typed settings and path edits during background snapshots.
     if (dialog.open && dialog.dataset.modal === state.modal) {
       const error = $('modal-error'); if (error) error.innerHTML = modalError();
@@ -814,7 +838,11 @@ export function startWorkspace(doc = document, win = window) {
 
   function saveModal() {
     const plan = state.plan, files = list(plan?.files), count = plan ? files.length : availableDocuments().length, packaged = count > 1;
-    return `${header(packaged ? '전체 문서에 반영하기' : '문서에 반영하기')}<div class="dialog-body"><p>${packaged ? `지금 보고 있는 문서와 함께 이 초안의 전체 ${count}개 문서를 저장해요. ` : ''}저장할 폴더와 내용을 확인해 주세요. 기존 문서를 보존하고 새 개정 폴더에 저장해요.</p><div id="modal-error">${modalError()}</div><form id="save-form"><div class="form-field"><label for="output-directory">저장 폴더 · 프로젝트 기준 상대 경로</label><input id="output-directory" name="directory" value="${esc(plan?.relative_directory || '')}" placeholder="비우면 프로젝트 이름으로 제안해요"><small>폴더를 바꾸면 다시 미리보기를 확인해 주세요.</small></div><button type="submit" class="secondary"${state.busy?' disabled':''}>저장 내용 미리보기</button></form>${plan?`<div class="diff"><div class="diff-header"><span>전체 ${files.length}개 문서 · 설계 기록 ${esc(plan.document_revision ?? draft()?.input_revision)}</span><span>${draftIsCurrent(state.session,draft())?'현재':'이전'} 대화 기준</span></div>${files.map(file=>`<div class="plan-file diff-line"><b>＋ ${esc(typeof file==='string'?file:`${plan.relative_directory}/${file.relative_path}`)}</b>${file.content || file.preview?`<pre>${esc(file.content || file.preview)}</pre>`:''}</div>`).join('')}${!files.length?`<div class="diff-line">${esc(plan.path || plan.bundle_path || plan.directory)}</div>`:''}</div><div class="inline-notice">저장 대상: 이 초안의 전체 ${files.length}개 문서 · 내용 상태: ${draft()?.content_status==='approved'?'검토본':'초안'}<br>파일 저장과 내용 확정은 별개예요.</div><div class="dialog-footer">${button('close-modal','검토로 돌아가기','quiet-button',state.busy)}<div class="button-row">${button('export-apply',packaged ? `전체 ${count}개를 ${draft()?.content_status==='approved'?'검토본':'초안'}으로 저장` : draft()?.content_status==='approved'?'검토본으로 저장':'초안으로 저장','primary',state.busy)}${canApprove()&&draft()?.content_status!=='approved'?button('approve-export',packaged ? `전체 ${count}개를 확정하고 저장` : '검토본으로 확정하고 저장','secondary',state.busy):''}</div></div>`:''}</div>`;
+    const applyLabel=packaged ? `전체 ${count}개를 ${draft()?.content_status==='approved'?'검토본':'초안'}으로 저장` : draft()?.content_status==='approved'?'검토본으로 저장':'초안으로 저장';
+    const entries=files.map(file=>`<div class="plan-file diff-line"><b>＋ ${esc(typeof file==='string'?file:`${plan.relative_directory}/${file.relative_path}`)}</b>${file.content || file.preview?`<details class="plan-preview"><summary>원문 미리보기</summary><pre>${esc(file.content || file.preview)}</pre></details>`:''}</div>`).join('');
+    const preview=plan?`<div class="diff"><div class="diff-header"><span>전체 ${files.length}개 문서 · 설계 기록 ${esc(plan.document_revision ?? draft()?.input_revision)}</span><span>${draftIsCurrent(state.session,draft())?'현재':'이전'} 대화 기준</span></div>${entries||`<div class="diff-line">${esc(plan.path || plan.bundle_path || plan.directory)}</div>`}</div><div class="inline-notice">저장 대상: 이 초안의 전체 ${files.length}개 문서 · 내용 상태: ${draft()?.content_status==='approved'?'검토본':'초안'}<br>파일 저장과 내용 확정은 별개예요.</div>`:'';
+    const actions=plan?`${button('export-apply',applyLabel,'primary',state.busy)}${canApprove()&&draft()?.content_status!=='approved'?button('approve-export',packaged ? `전체 ${count}개를 확정하고 저장` : '검토본으로 확정하고 저장','secondary',state.busy):''}`:`<button type="submit" form="save-form" class="primary"${state.busy?' disabled':''}>새 미리보기 확인</button>`;
+    return `${header(packaged ? '전체 문서에 반영하기' : '문서에 반영하기')}<div class="dialog-body save-dialog-body"><p>${packaged ? `지금 보고 있는 문서와 함께 이 초안의 전체 ${count}개 문서를 저장해요. ` : ''}저장할 폴더와 파일 목록을 확인해 주세요. 원문은 각 파일의 미리보기를 펼쳐 볼 수 있어요.</p><div id="modal-error">${modalError()}</div><form id="save-form"><div class="form-field"><label for="output-directory">저장 폴더 · 프로젝트 기준 상대 경로</label><input id="output-directory" name="directory" value="${esc(plan?.relative_directory || '')}" placeholder="비우면 프로젝트 이름으로 제안해요"><small>기존 문서는 보존하고 새 개정 폴더에 저장해요. 폴더를 바꾸면 다시 미리보기를 확인해 주세요.</small></div><button type="submit" class="secondary"${state.busy?' disabled':''}>저장 내용 미리보기</button></form>${preview}</div><div class="dialog-footer save-dialog-footer">${button('close-modal','검토로 돌아가기','quiet-button',state.busy)}<div class="button-row">${actions}</div></div>`;
   }
 
   function closeModal() {
@@ -893,15 +921,109 @@ export function startWorkspace(doc = document, win = window) {
     state.saved=result.export.result; state.lastExport=result.export; state.scene='saved'; state.modal=null; state.plan=null; state.restoreFocus=true;
     delete dialog.dataset.modal; dialog.close(); announce('설계 문서를 저장했어요.');
     await refresh({keep:true});
+    if(!state.connectionBlocked)void fileWorkspace?.load();
   }
 
   function newSession() {
     if (state.busy || state.connectionBlocked) return;
+    fileWorkspace?.showChat();
+    if(win.matchMedia?.('(max-width:1030px)').matches){state.leftCollapsed=true;renderPanels();}
     state.requestEpoch++; state.feed?.abort(); state.feed=null;
     state.session=null; state.run=null; state.scene='welcome'; state.selectedDraft=null; state.selectedDocument='architecture'; state.documentAnchor=null;
     state.error=null; state.notice=''; state.cursor=''; state.answer=''; state.saved=null; state.lastExport=null;
     state.intro=''; state.contextPaths.clear();
     render(); $('project-intro')?.focus();
+  }
+
+  function currentReadingContext() {
+    if(fileWorkspace?.active!=='chat'&&fileWorkspace)return fileWorkspace.context;
+    const scene=state.scene==='generating'?state.runScene:state.scene;
+    if(scene!=='review'||!draft())return null;
+    const document=selectedDocument(),container=doc.querySelector?.('[data-document-preview]');
+    return document&&container?{file:document.filename,name:document.title,source:'draft',container}:null;
+  }
+
+  function renderRecorderControls() {
+    if(!documentRecorder||state.disposed)return;
+    const recording=documentRecorder.state,context=currentReadingContext();
+    const reading=context?`${context.source}:${context.file}`:'';
+    if(reading!==lastReading){lastReading=reading;if(context)documentRecorder.note('open',context);}
+    const active=['starting','recording','stopping','uploading'].includes(recording.phase);
+    $('document-recorder').hidden=!context&&!active&&!recording.result&&!recording.error;
+    $('record-toggle').textContent=recording.phase==='recording'?'녹음 중지':recording.phase==='starting'?'마이크 준비 중…':recording.phase==='uploading'?'음성 전사 중…':'녹음 시작';
+    $('record-toggle').disabled=state.connectionBlocked||(!context&&recording.phase!=='recording')||['starting','stopping','uploading'].includes(recording.phase);
+    $('record-status').textContent=({idle:'문서를 보며 음성으로 지시해 주세요.',starting:'전사 설정과 마이크를 확인하고 있어요.',recording:'녹음 중',stopping:'녹음을 마무리하고 있어요.',uploading:'음성을 전사하고 있어요.',complete:'전사와 지시문을 만들었어요.',error:'녹음을 확인해 주세요.'})[recording.phase]||'';
+    const seconds=Math.floor(recording.elapsed/1000);$('record-time').textContent=`${String(Math.floor(seconds/60)).padStart(2,'0')}:${String(seconds%60).padStart(2,'0')}`;
+    $('record-events').textContent=recording.events.length?`문서 참조 ${recording.events.length}개`:'';
+    $('record-error').textContent=recording.error;$('record-error').hidden=!recording.error;
+    $('record-copy').hidden=!recording.result;
+  }
+
+  async function ensureFileWorkspace() {
+    if(!doc.querySelector?.('#file-tree')||!token||state.connectionBlocked||state.disposed||viewerPromise)return;
+    const epoch=state.workspaceEpoch;
+    viewerPromise=Promise.all([import('./file-viewer.js'),import('./document-recorder.js'),import('./viewer-menu.js')]).then(([files,recording,menus])=>{
+      if(state.disposed||state.connectionBlocked||epoch!==state.workspaceEpoch)return;
+      viewerMenu=menus.createViewerMenu({doc,win,announce});
+      documentRecorder=recording.createDocumentRecorder({api,getContext:currentReadingContext,mediaDevices:win.navigator.mediaDevices,MediaRecorder:win.MediaRecorder,now:()=>win.performance.now(),onChange:renderRecorderControls,onResult:result=>{if(!state.connectionBlocked&&!state.disposed)void viewerMenu.copy(result.instruction,'음성 지시문');}});
+      fileWorkspace=files.createFileViewer({doc,win,api,menu:viewerMenu,announce,onActive:(path,{changed}={})=>{
+        if(state.disposed)return;
+        state.fileTabActive=path!=='chat';
+        if(changed&&path==='chat')render();
+        if(changed&&path!=='chat'&&win.matchMedia?.('(max-width:1030px)').matches){state.leftCollapsed=true;renderPanels();}
+        renderRecorderControls();
+      }});
+      $('record-toggle').addEventListener('click',()=>{if(state.connectionBlocked)return;if(documentRecorder.state.phase==='recording')documentRecorder.stop();else void documentRecorder.start();});
+      $('record-copy').addEventListener('click',()=>{if(documentRecorder.state.result)void viewerMenu.copy(documentRecorder.state.result.instruction,'음성 지시문');});
+      $('recording-settings').addEventListener('click',()=>void openTranscriptionSettings());
+      const contextAt=target=>{
+        const context=currentReadingContext();if(!context?.container||!context.container.contains(target))return null;
+        const element=target.nodeType===1?target:target.parentElement;let heading=element?.closest?.('h1,h2,h3,h4,h5,h6');
+        if(!heading)for(const candidate of context.container.querySelectorAll('h1,h2,h3,h4,h5,h6')){if(candidate.compareDocumentPosition(element)&4)heading=candidate;}
+        return {...context,heading:heading?.textContent?.trim()||'',anchor:heading?.dataset.documentAnchor||''};
+      };
+      const rangeContext=(context,range)=>{
+        const pre=context?.kind==='text'?context.container.querySelector('pre'):null;
+        if(!pre||!range||!pre.contains(range.startContainer)||!pre.contains(range.endContainer))return context;
+        const prefix=doc.createRange();prefix.selectNodeContents(pre);prefix.setEnd(range.startContainer,range.startOffset);const start=prefix.toString().length;prefix.setEnd(range.endContainer,range.endOffset);
+        return {...context,...recording.lineRangeFromOffsets(pre.textContent,start,prefix.toString().length)};
+      };
+      const selection=type=>{if(documentRecorder.state.phase!=='recording'||doc.activeElement?.closest?.('dialog'))return;const selected=win.getSelection();if(!selected||selected.isCollapsed)return;const context=contextAt(selected.anchorNode);if(context&&context.container.contains(selected.focusNode))documentRecorder.note(type,rangeContext(context,selected.getRangeAt(0)),selected.toString());};
+      doc.addEventListener('click',event=>{if(documentRecorder.state.phase!=='recording'||!win.getSelection()?.isCollapsed)return;const context=contextAt(event.target);if(context)documentRecorder.note('focus',rangeContext(context,doc.caretRangeFromPoint?.(event.clientX,event.clientY)),event.target.closest?.('p,li,td,pre,h1,h2,h3,h4,h5,h6')?.textContent?.slice(0,300)||'');});
+      doc.addEventListener('mouseup',()=>selection('selection'));doc.addEventListener('keyup',event=>{if(event.key==='Shift'||event.shiftKey)selection('selection');});doc.addEventListener('copy',()=>selection('copy'));
+      renderRecorderControls();void fileWorkspace.load();
+    }).catch(()=>{if(!state.connectionBlocked&&!state.disposed)$('file-tree').textContent='파일 보기를 준비하지 못했어요. 화면을 다시 열어 주세요.';}).finally(()=>{if(!fileWorkspace)viewerPromise=null;});
+    return viewerPromise;
+  }
+
+  function clearTranscriptionDialog() {
+    transcriptionEpoch++;transcriptionRequest?.abort();
+    if(!transcriptionDialog)return;
+    for(const input of transcriptionDialog.querySelectorAll('input')){input.value='';input.checked=false;}
+    transcriptionDialog.querySelector('[data-transcription-message]').textContent='';
+    if(transcriptionDialog.open)transcriptionDialog.close();
+  }
+
+  async function openTranscriptionSettings() {
+    if(state.connectionBlocked||!documentRecorder)return;
+    if(!transcriptionDialog){
+      transcriptionDialog=doc.createElement('dialog');transcriptionDialog.id='transcription-dialog';transcriptionDialog.setAttribute('aria-labelledby','transcription-title');
+      transcriptionDialog.innerHTML='<div class="dialog-header"><div><p class="eyebrow">음성 지시</p><h2 id="transcription-title">음성 전사 설정</h2></div><button type="button" class="dialog-close" data-transcription-close aria-label="음성 설정 닫기">×</button></div><div class="dialog-body"><p>OpenAI API 키는 서버의 별도 공용 보관함에 저장돼요. 이 화면과 프로젝트 기록에 키를 남기지 않아요. 녹음 전 키 설정 여부를 먼저 확인해요.</p><p data-transcription-message role="status"></p><form id="transcription-form"><fieldset><div class="form-field"><label for="transcription-key">OpenAI API 키</label><input id="transcription-key" name="api_key" type="password" autocomplete="off" spellcheck="false" placeholder="새 키를 입력하거나 비워 두어 기존 키 유지"><small>저장된 키는 다시 표시하지 않아요.</small></div><label class="confirm-row"><input id="transcription-clear-key" type="checkbox">서버에 저장한 키 삭제</label><div class="form-field"><label for="transcription-model">음성 전사 모델</label><input id="transcription-model" name="model" required maxlength="200" autocomplete="off"></div><div class="dialog-footer"><button type="button" class="quiet-button" data-transcription-close>취소</button><button type="submit" class="primary">전사 설정 저장</button></div></fieldset></form></div>';
+      doc.body.append(transcriptionDialog);
+      transcriptionDialog.addEventListener('click',event=>{if(event.target.closest('[data-transcription-close]'))clearTranscriptionDialog();});
+      transcriptionDialog.addEventListener('cancel',event=>{event.preventDefault();clearTranscriptionDialog();});
+      transcriptionDialog.querySelector('form').addEventListener('submit',event=>{
+        event.preventDefault();const form=event.target;if(!form.reportValidity()||form.querySelector('fieldset').disabled)return;
+        const epoch=transcriptionEpoch,input=$('transcription-key'),payload={model:$('transcription-model').value.trim()};
+        if($('transcription-clear-key').checked)payload.api_key=null;else if(input.value.trim())payload.api_key=input.value.trim();
+        input.value='';form.querySelector('fieldset').disabled=true;transcriptionRequest=new AbortController();
+        void api('/api/v1/transcription/key',{method:'PATCH',body:payload,signal:transcriptionRequest.signal}).then(()=>{if(epoch===transcriptionEpoch)clearTranscriptionDialog();}).catch(error=>{if(epoch===transcriptionEpoch)transcriptionDialog.querySelector('[data-transcription-message]').textContent=error.message;}).finally(()=>{payload.api_key=null;if(epoch===transcriptionEpoch)form.querySelector('fieldset').disabled=false;});
+      });
+    }
+    clearTranscriptionDialog();const epoch=transcriptionEpoch;
+    const form=transcriptionDialog.querySelector('form'),message=transcriptionDialog.querySelector('[data-transcription-message]');form.querySelector('fieldset').disabled=true;message.textContent='전사 설정을 확인하고 있어요…';transcriptionDialog.showModal();transcriptionRequest=new AbortController();
+    try{const result=await api('/api/v1/transcription/settings',{signal:transcriptionRequest.signal});if(epoch!==transcriptionEpoch||!transcriptionDialog.open)return;$('transcription-model').value=result.model||'';message.textContent=result.configured?(result.key_source==='environment'?'환경 변수의 키를 사용하고 있어요.':'서버에 저장된 키를 사용하고 있어요.'):'아직 OpenAI API 키가 없어요.';form.querySelector('fieldset').disabled=false;$('transcription-key').focus();}
+    catch(error){if(epoch===transcriptionEpoch)message.textContent=error.message;}
   }
 
   doc.addEventListener('click', event => {
@@ -916,7 +1038,16 @@ export function startWorkspace(doc = document, win = window) {
     if (action==='timeout-settings') { void openSettings(target,{focusTimeout:true}); return; }
     if (action==='new-session') { newSession(); return; }
     if (action==='close-modal') { closeModal(); return; }
-    if (action==='toggle-info') { const open=doc.body.classList.toggle('show-info'); target.setAttribute('aria-expanded',String(open)); return; }
+    if (action==='toggle-sidebar') {
+      state.leftCollapsed=!state.leftCollapsed;
+      if(!state.leftCollapsed&&win.matchMedia?.('(max-width:1030px)').matches)state.rightCollapsed=true;
+      renderPanels();return;
+    }
+    if (action==='toggle-info') {
+      state.rightCollapsed=!state.rightCollapsed;
+      if(!state.rightCollapsed&&win.matchMedia?.('(max-width:1030px)').matches)state.leftCollapsed=true;
+      renderPanels();return;
+    }
     if (action==='interview' || action==='review' || action==='inspect-draft') {
       const scene=action==='interview'?'interview':'review';
       if (runIsActive(state.run)) { state.runScene=scene; state.scene='generating'; }
@@ -1074,7 +1205,7 @@ export function startWorkspace(doc = document, win = window) {
   doc.addEventListener('keydown',event=> {
     if (inDocumentPreview(event.target)) return;
     if (event.target.id==='answer-input' && event.key==='Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); event.target.form.requestSubmit(); }
-    if (event.target.matches('[role="tab"]') && ['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) {
+    if (event.target.matches('.aux-tab') && ['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) {
       event.preventDefault(); state.panel=event.key==='Home'?'notes':event.key==='End'?'documents':state.panel==='notes'?'documents':'notes'; renderAux(); $(state.panel+'-tab').focus();
     }
   });
@@ -1088,7 +1219,7 @@ export function startWorkspace(doc = document, win = window) {
     win.location.reload?.();
   });
   win.addEventListener('online',()=> { void refresh({keep:false}).catch(()=>connection('offline')); });
-  win.addEventListener('pagehide',()=> { state.disposed=true; state.feed?.abort(); win.clearTimeout(state.diagnosticTimer); win.clearTimeout(state.refreshTimer); });
+  win.addEventListener('pagehide',()=> { state.disposed=true;documentRecorder?.dispose();clearTranscriptionDialog();fileWorkspace?.dispose();viewerMenu?.dispose();state.feed?.abort();win.clearTimeout(state.diagnosticTimer);win.clearTimeout(state.refreshTimer); });
 
   if (!token) { state.scene='welcome'; render(); connection('offline'); }
   else void refresh({initial:true,keep:false}).then(()=>{if(!state.session && !state.connectionBlocked)connection('connected');}).catch(error=> { if (state.connectionBlocked) return; state.scene='welcome'; connection('offline'); showError(error); });

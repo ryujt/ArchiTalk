@@ -14,26 +14,35 @@
 <body>
   <header class="app-header">
     <div class="header-left">
+      <button class="quiet-button sidebar-toggle" id="sidebar-toggle" type="button" data-action="toggle-sidebar" aria-controls="project-sidebar" aria-expanded="true" aria-label="프로젝트 파일"><span aria-hidden="true">☰</span><span class="panel-toggle-label">파일</span></button>
       <a class="brand" href="/" aria-label="ArchiTalk 시작"><span class="brand-mark" aria-hidden="true">a</span>ArchiTalk</a>
       <span class="project-crumb">프로젝트 <b id="project-name">확인 중</b></span>
     </div>
     <div class="header-right">
       <span class="connection" id="connection" role="status"><span class="connection-dot" aria-hidden="true"></span><span>연결 중</span></span>
-      <button class="quiet-button mobile-info" type="button" data-action="toggle-info" aria-controls="aux-panel" aria-expanded="false">설계 메모</button>
+      <button class="quiet-button mobile-info" id="info-toggle" type="button" data-action="toggle-info" aria-controls="aux-panel" aria-expanded="true" aria-label="설계 메모"><span aria-hidden="true">▤</span><span class="panel-toggle-label">설계 메모</span></button>
       <button class="quiet-button" type="button" data-action="settings">도구 설정</button>
     </div>
   </header>
   <div class="app-body">
-    <aside class="sidebar" aria-label="프로젝트와 대화">
+    <aside class="sidebar" id="project-sidebar" aria-label="프로젝트와 대화">
       <div><p class="sidebar-title">현재 프로젝트</p><p class="project-title" id="sidebar-project">확인 중</p><span class="local-label">이 폴더에서 시작한 설계</span><div id="session-list" class="session-list"></div><button class="secondary new-session" type="button" data-action="new-session">＋ 새 대화</button></div>
       <nav class="steps" aria-label="설계 단계"><span class="step" id="step-interview"><span class="step-number">1</span>이야기 나누기</span><span class="step" id="step-review"><span class="step-number">2</span>초안 살펴보기</span><span class="step" id="step-save"><span class="step-number">3</span>문서에 반영하기</span></nav>
-      <div class="sidebar-bottom"><p>대화는 로컬에 기록돼요.<br>문서는 반영을 선택할 때 저장해요.</p><p id="root-display" class="mono"></p></div>
+      <div class="sidebar-bottom"><div class="file-tree-heading"><h3>프로젝트 파일</h3><button type="button" class="quiet-button" id="file-tree-refresh" aria-label="파일 목록 새로고침">↻</button></div><div id="file-tree" class="file-tree" aria-label="볼 수 있는 파일 목록"><p class="small muted">파일 목록을 확인하고 있어요.</p></div><p class="sidebar-privacy">대화는 로컬에 기록돼요.<br>문서는 반영을 선택할 때 저장해요.</p><p id="root-display" class="mono"></p></div>
     </aside>
     <main class="workspace" id="main" tabindex="-1">
       <div class="workspace-top"><div><p class="eyebrow">DESIGN TOGETHER</p><h2 id="workspace-title">프로젝트 설계</h2></div><span class="phase-pill" id="phase">연결 확인</span></div>
+      <div id="workspace-tabs" class="workspace-tabs" role="tablist" aria-label="작업 탭"></div>
+      <section id="document-recorder" class="document-recorder" aria-label="문서 보며 음성 지시 녹음" hidden>
+        <div class="recorder-controls"><button type="button" id="record-toggle" class="secondary">녹음 시작</button><span id="record-status" role="status">녹음 준비</span><span id="record-time" class="mono">00:00</span><span id="record-events" class="small muted"></span><button type="button" id="recording-settings" class="quiet-button">음성 전사 설정</button><button type="button" id="record-copy" class="quiet-button" hidden>지시문 다시 복사</button></div>
+        <p id="record-error" class="recorder-error" role="alert" hidden></p>
+      </section>
+      <section id="chat-workspace">
       <select class="session-switcher" id="session-switcher" aria-label="대화 선택"></select>
       <div id="notice" aria-live="polite"></div>
       <div class="workspace-content" id="workspace-content"><p class="loading" role="status">로컬 워크스페이스를 확인하고 있어요.</p></div>
+      </section>
+      <section id="file-workspace" hidden aria-label="파일 보기"><div class="file-toolbar"><div><h3 id="file-title"></h3><p id="file-path" class="mono"></p></div><button id="file-reload" type="button" class="secondary">파일 다시 읽기</button></div><p id="file-load-state" role="status" hidden></p><div id="file-content"></div></section>
       <footer class="workspace-footer">ArchiTalk · 생각을 나누고, 설계로 남기세요. · <a href="/vendor/THIRD-PARTY-NOTICES.txt" target="_blank" rel="noopener noreferrer">오픈소스 라이선스</a></footer>
     </main>
     <aside class="aux-panel" id="aux-panel" aria-label="설계 참고 정보">

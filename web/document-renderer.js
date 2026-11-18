@@ -7,10 +7,12 @@ import { navigationToMermaid } from './diagrams/navigation.js';
 import { findTextFenceClose } from './diagrams/block-parser.js';
 import { fixCjkEmphasis } from './diagrams/cjk-emphasis.js';
 import { preprocessSmartMd, applySmartTableSpecs } from './diagrams/smartmd.js';
+import { mountDiagramViewport } from './diagram-viewport.js';
 
 const generations = new WeakMap();
 const documentAnchors = new WeakMap();
 const documentLinkHandlers = new WeakMap();
+const documentViewports = new WeakMap();
 const diagramLanguages = new Set(['jobflow', 'layout', 'state', 'navigation', 'mermaid']);
 let mermaidModule;
 let mermaidQueue = Promise.resolve();
@@ -62,6 +64,28 @@ export function resolveDocumentTarget(href, documentLinks = [], currentDocument 
   return match ? { kind: match.kind, anchor: anchor === null ? null : anchor.toLowerCase() } : null;
 }
 
+/** Project-file links are callbacks into a server-owned catalog, never URLs. */
+export function resolveFileTarget(href, currentFile, fileLinks = []) {
+  const value = String(href || '').trim();
+  if (!value || typeof currentFile !== 'string' || !currentFile || /[\u0000-\u001f\u007f\\?]/.test(value) || value.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(value)) return null;
+  const hash = value.indexOf('#');
+  const file = decodePart(hash < 0 ? value : value.slice(0, hash));
+  const anchor = hash < 0 ? null : decodePart(value.slice(hash + 1));
+  if (file === null || (hash >= 0 && anchor === null) || /[\u0000-\u001f\u007f\\?]/.test(file) || file.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(file) || (anchor !== null && /[\u0000-\u001f\u007f]/.test(anchor))) return null;
+  const base = currentFile.normalize('NFC');
+  if (/[\u0000-\u001f\u007f\\?#]/.test(base) || base.startsWith('/') || base.split('/').some(part => !part || part === '.' || part === '..')) return null;
+  const parts = file ? base.split('/').slice(0, -1) : base.split('/');
+  if (file) for (const part of file.split('/')) {
+    if (part === '.') continue;
+    if (!part) return null;
+    if (part === '..') { if (!parts.length) return null; parts.pop(); }
+    else parts.push(part);
+  }
+  const resolved = parts.join('/');
+  const target = resolved === base ? currentFile : (Array.isArray(fileLinks) ? fileLinks : []).find(path => typeof path === 'string' && path.normalize('NFC') === resolved);
+  return target ? { path: target, anchor: anchor === null ? null : anchor.toLowerCase() } : null;
+}
+
 function assignHeadingIds(root, prefix) {
   const anchors = new Map();
   for (const heading of root.querySelectorAll('h1,h2,h3,h4,h5,h6')) {
@@ -69,6 +93,9 @@ function assignHeadingIds(root, prefix) {
     let slug = base, duplicate = 0;
     while (anchors.has(slug)) slug = `${base}-${++duplicate}`;
     heading.id = `${prefix}-heading-${slug || 'section'}`;
+    // Trusted location metadata for recording; raw document data attributes
+    // were removed before these actual, duplicate-aware anchors were assigned.
+    heading.dataset.documentAnchor = slug;
     anchors.set(slug, heading);
   }
   return anchors;
@@ -87,11 +114,20 @@ export function scrollToDocumentAnchor(container, anchor = '') {
 function safeLinks(root, options, anchors) {
   const localLinks = new WeakMap();
   const kind = options.currentDocument || 'architecture';
+  const fileMode = typeof options.currentFile === 'string' && typeof options.onFileLink === 'function';
   for (const link of root.querySelectorAll('a')) {
     const href = (link.getAttribute('href') || '').trim();
     if (/^(?:https?:\/\/|mailto:)/i.test(href) && !/[\u0000-\u0020\u007f]/.test(href)) {
       link.setAttribute('target', '_blank');
       link.setAttribute('rel', 'noopener noreferrer nofollow');
+      continue;
+    }
+    if (fileMode) {
+      const target = resolveFileTarget(href, options.currentFile, options.fileLinks);
+      if (!target) { link.removeAttribute('href'); continue; }
+      const heading = target.path === options.currentFile && target.anchor !== null ? anchors.get(target.anchor) : null;
+      link.setAttribute('href', heading ? `#${heading.id}` : '#');
+      link.classList.add('document-package-link'); localLinks.set(link, { ...target, file: true });
       continue;
     }
     const target = resolveDocumentTarget(href, options.documentLinks, kind);
@@ -113,7 +149,9 @@ function installDocumentLinks(container, localLinks, options, current) {
     if (!target) return;
     event.preventDefault();
     if (!current() || event.type === 'auxclick') return;
-    if (target.kind === (options.currentDocument || 'architecture')) scrollToDocumentAnchor(container, target.anchor || '');
+    if (target.file && target.path === options.currentFile) scrollToDocumentAnchor(container, target.anchor || '');
+    else if (target.file) options.onFileLink?.({ path: target.path, anchor: target.anchor });
+    else if (target.kind === (options.currentDocument || 'architecture')) scrollToDocumentAnchor(container, target.anchor || '');
     else options.onDocumentLink?.({ ...target });
   };
   container.addEventListener('click', listener);
@@ -261,12 +299,6 @@ function sanitizeSvg(svg, prefix, decodeMermaidLabels = false) {
       text.nodeValue = text.nodeValue.replace(/&#(34|40|41|64|91|93|123|125);|&quot;/g, (entity, code) => code ? punctuation[code] : '"');
     }
   }
-  // Preserve readable diagram text on narrow screens; the figure itself owns
-  // horizontal scrolling, rather than shrinking a whole graph to phone width.
-  const viewBox = (root.getAttribute('viewBox') || '').trim().split(/[ ,]+/).map(Number);
-  const intrinsicWidth = viewBox.length === 4 && viewBox.every(Number.isFinite) ? viewBox[2] : Number.parseFloat(root.getAttribute('width'));
-  if (Number.isFinite(intrinsicWidth) && intrinsicWidth > 0) root.style.minWidth = `${Math.max(280, Math.min(1600, intrinsicWidth))}px`;
-  root.removeAttribute('height');
   root.setAttribute('role', 'img');
   return root;
 }
@@ -306,7 +338,7 @@ function diagramError(figure, source, error) {
   figure.dataset.diagramStatus = 'error';
 }
 
-async function fillDiagram(figure, diagram, prefix, current) {
+async function fillDiagram(figure, diagram, prefix, current, viewports) {
   try {
     assertDiagramSize(diagram.source);
     let output;
@@ -329,14 +361,20 @@ async function fillDiagram(figure, diagram, prefix, current) {
     }
     if (!current() || !figure.isConnected || !output) return;
     figure.appendChild(output);
+    viewports.push(mountDiagramViewport(figure, { current }));
     figure.dataset.diagramStatus = 'ready';
   } catch (error) {
-    if (current() && figure.isConnected) diagramError(figure, diagram.source, error);
+    if (current() && figure.isConnected) {
+      for (const child of [...figure.children]) if (child.tagName !== 'FIGCAPTION') child.remove();
+      diagramError(figure, diagram.source, error);
+    }
   }
 }
 
 /** Render untrusted Markdown/SmartMD in place. Returns when its local diagrams settle. */
 export async function renderDocument(container, markdown, options = {}) {
+  for (const dispose of documentViewports.get(container) || []) dispose();
+  const viewports = []; documentViewports.set(container, viewports);
   const generation = (generations.get(container) || 0) + 1;
   generations.set(container, generation);
   documentAnchors.delete(container);
@@ -373,13 +411,14 @@ export async function renderDocument(container, markdown, options = {}) {
     container.replaceChildren(fragment);
     documentAnchors.set(container, anchors);
     installDocumentLinks(container, localLinks, options, current);
-    await Promise.all(pending.map(({ figure, diagram, prefix: id }) => fillDiagram(figure, diagram, id, current)));
+    await Promise.all(pending.map(({ figure, diagram, prefix: id }) => fillDiagram(figure, diagram, id, current, viewports)));
     if (current()) {
       container.dataset.renderState = 'ready'; container.setAttribute('aria-busy', 'false');
       if (options.anchor !== undefined && options.anchor !== null) scrollToDocumentAnchor(container, options.anchor);
     }
   } catch (error) {
     if (!current()) return;
+    for (const dispose of viewports) dispose();
     container.replaceChildren();
     diagramError(container, source, error);
     container.dataset.renderState = 'error';

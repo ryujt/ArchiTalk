@@ -4,7 +4,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{
@@ -34,6 +34,12 @@ impl IntoResponse for AppError {
             "unauthorized" => StatusCode::UNAUTHORIZED,
             "forbidden" => StatusCode::FORBIDDEN,
             "operation_failed" => StatusCode::INTERNAL_SERVER_ERROR,
+            "transcription_busy" | "transcription_rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+            "shutting_down" => StatusCode::SERVICE_UNAVAILABLE,
+            "transcription_timeout" => StatusCode::GATEWAY_TIMEOUT,
+            "transcription_upstream_failed"
+            | "transcription_connection_failed"
+            | "transcription_response_invalid" => StatusCode::BAD_GATEWAY,
             _ => StatusCode::BAD_REQUEST,
         };
         (
@@ -67,6 +73,19 @@ pub fn router(state: ServerState) -> Router {
         .route("/runs/{id}/events", get(run_events))
         .route("/settings", get(settings).patch(update_settings))
         .route("/settings/diagnostics", post(diagnostics))
+        .route("/files/tree", get(viewer_tree))
+        .route("/files/read", get(viewer_read))
+        .route("/transcription/settings", get(transcription_settings))
+        .route(
+            "/transcription/key",
+            axum::routing::patch(transcription_key),
+        )
+        .route(
+            "/transcription",
+            post(transcription).layer(DefaultBodyLimit::max(
+                crate::transcription::MAX_REQUEST_BYTES,
+            )),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .route("/", get(index))
@@ -74,6 +93,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/app.js", get(script))
         .route("/style.css", get(style))
         .route("/document-renderer.js", get(document_renderer))
+        .route("/diagram-viewport.js", get(diagram_viewport))
+        .route("/file-viewer.js", get(file_viewer))
+        .route("/document-recorder.js", get(document_recorder))
+        .route("/viewer-menu.js", get(viewer_menu))
         .route("/document.css", get(document_style))
         .route("/diagrams/{name}", get(diagram_asset))
         .route("/vendor/{name}", get(vendor_asset))
@@ -108,6 +131,18 @@ async fn style() -> impl IntoResponse {
 }
 async fn document_renderer() -> impl IntoResponse {
     javascript(include_str!("../web/document-renderer.js"))
+}
+async fn diagram_viewport() -> impl IntoResponse {
+    javascript(include_str!("../web/diagram-viewport.js"))
+}
+async fn file_viewer() -> impl IntoResponse {
+    javascript(include_str!("../web/file-viewer.js"))
+}
+async fn document_recorder() -> impl IntoResponse {
+    javascript(include_str!("../web/document-recorder.js"))
+}
+async fn viewer_menu() -> impl IntoResponse {
+    javascript(include_str!("../web/viewer-menu.js"))
 }
 async fn document_style() -> impl IntoResponse {
     (
@@ -281,6 +316,90 @@ async fn settings(State(s): State<ServerState>) -> Result<Json<Value>, AppError>
 }
 async fn diagnostics(State(s): State<ServerState>) -> Result<Json<Value>, AppError> {
     Ok(Json(s.app.diagnostics().await?))
+}
+async fn viewer_tree(State(s): State<ServerState>) -> Result<Json<Value>, AppError> {
+    Ok(Json(s.app.viewer_tree().await?))
+}
+#[derive(Deserialize)]
+struct ViewerPath {
+    path: String,
+}
+async fn viewer_read(
+    State(s): State<ServerState>,
+    Query(path): Query<ViewerPath>,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(s.app.viewer_read(path.path).await?))
+}
+async fn transcription_settings(
+    State(s): State<ServerState>,
+) -> Result<Json<crate::transcription::Settings>, AppError> {
+    Ok(Json(s.app.transcription_settings()?))
+}
+async fn transcription_key(
+    State(s): State<ServerState>,
+    Json(value): Json<Value>,
+) -> Result<Json<crate::transcription::Settings>, AppError> {
+    Ok(Json(s.app.update_transcription(&value)?))
+}
+async fn transcription(
+    State(s): State<ServerState>,
+    request: Request,
+) -> Result<Json<crate::transcription::Transcript>, AppError> {
+    let job = s.app.begin_transcription()?;
+    let boundary = async {
+        loop {
+            s.app.ensure_workspace_current()?;
+            tokio::select! {
+                _ = s.app.shutdown.cancelled() => return Err(AppError::new("shutting_down", "서버가 종료 중입니다.")),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
+    };
+    let work = async {
+        let mut multipart = Multipart::from_request(request, &s)
+            .await
+            .map_err(|_| AppError::new("invalid_audio", "오디오 multipart 요청을 확인하세요."))?;
+        let mut audio = None;
+        while let Some(mut field) = multipart
+            .next_field()
+            .await
+            .map_err(|_| AppError::new("invalid_audio", "오디오 요청을 읽을 수 없습니다."))?
+        {
+            if field.name() != Some("audio") || audio.is_some() {
+                return Err(AppError::new(
+                    "invalid_audio",
+                    "audio 필드 하나만 전송하세요.",
+                ));
+            }
+            let mime = field.content_type().unwrap_or("").to_owned();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = field.chunk().await.map_err(|_| {
+                AppError::new(
+                    "invalid_audio",
+                    "오디오 요청이 허용 크기를 넘었거나 올바르지 않습니다.",
+                )
+            })? {
+                if bytes.len().saturating_add(chunk.len()) > crate::transcription::MAX_AUDIO_BYTES {
+                    return Err(AppError::new(
+                        "invalid_audio",
+                        "오디오는 20 MiB 이내여야 합니다.",
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            audio = Some((bytes, mime));
+        }
+        let (bytes, mime) =
+            audio.ok_or_else(|| AppError::new("invalid_audio", "audio 필드가 필요합니다."))?;
+        s.app.transcribe_audio(job, bytes, &mime).await.map(Json)
+    };
+    tokio::select! {
+        biased;
+        result = boundary => result,
+        result = tokio::time::timeout(Duration::from_secs(crate::transcription::TIMEOUT_SECONDS), work) => {
+            result.map_err(|_| AppError::new("transcription_timeout", "음성 전사 요청이 120초 제한을 초과했습니다."))?
+        }
+    }
 }
 async fn create(
     State(s): State<ServerState>,

@@ -69,6 +69,7 @@ pub struct App {
     diagnostic_gate: tokio::sync::Mutex<()>,
     trusted: Settings,
     shared_config: Option<PathBuf>,
+    transcription: crate::transcription::Service,
 }
 struct Launch {
     run_id: String,
@@ -90,6 +91,7 @@ impl App {
         settings: Settings,
         shared_config: Option<PathBuf>,
     ) -> anyhow::Result<Arc<Self>> {
+        let transcription = crate::transcription::Service::new(shared_config.as_deref())?;
         let mut store = Store::open(root)?;
         let project_files = store.project_files()?;
         let root = store.root().to_owned();
@@ -165,6 +167,7 @@ impl App {
             diagnostic_gate: tokio::sync::Mutex::new(()),
             trusted: settings,
             shared_config,
+            transcription,
         }))
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -187,6 +190,83 @@ impl App {
     pub fn ensure_workspace_current(&self) -> Result<()> {
         drop(self.checked_lock()?);
         Ok(())
+    }
+    pub async fn viewer_tree(self: &Arc<Self>) -> Result<Value> {
+        self.ensure_workspace_current()?;
+        let app = self.clone();
+        tokio::task::spawn_blocking(move || {
+            app.ensure_workspace_current()?;
+            let mut tree =
+                serde_json::to_value(app.files.viewer_tree().map_err(|_| {
+                    AppError::new("file_unavailable", "파일 목록을 읽을 수 없습니다.")
+                })?)
+                .map_err(anyhow::Error::from)?;
+            app.ensure_workspace_current()?;
+            tree["root_display"] = json!(app.root.display().to_string());
+            Ok(tree)
+        })
+        .await
+        .map_err(|_| AppError::new("file_unavailable", "파일 목록을 읽을 수 없습니다."))?
+    }
+    pub async fn viewer_read(self: &Arc<Self>, path: String) -> Result<Value> {
+        self.ensure_workspace_current()?;
+        let app = self.clone();
+        tokio::task::spawn_blocking(move || {
+            app.ensure_workspace_current()?;
+            let file = app.files.viewer_read(&path).map_err(|_| {
+                AppError::new(
+                    "file_unavailable",
+                    "보기가 허용된 UTF-8 파일인지 경로와 크기를 확인하세요.",
+                )
+            })?;
+            app.ensure_workspace_current()?;
+            let absolute_path = app.root.join(&file.path);
+            let mut value = serde_json::to_value(file).map_err(anyhow::Error::from)?;
+            value["absolute_path"] = json!(absolute_path.display().to_string());
+            Ok(value)
+        })
+        .await
+        .map_err(|_| AppError::new("file_unavailable", "파일을 읽을 수 없습니다."))?
+    }
+    pub fn transcription_settings(&self) -> Result<crate::transcription::Settings> {
+        self.ensure_workspace_current()?;
+        let settings = self.transcription.settings().map_err(transcription_error)?;
+        self.ensure_workspace_current()?;
+        Ok(settings)
+    }
+    pub fn update_transcription(&self, value: &Value) -> Result<crate::transcription::Settings> {
+        self.ensure_workspace_current()?;
+        let settings = self
+            .transcription
+            .update(value)
+            .map_err(transcription_error)?;
+        self.ensure_workspace_current()?;
+        Ok(settings)
+    }
+    pub(crate) fn begin_transcription(&self) -> Result<crate::transcription::Job> {
+        self.ensure_workspace_current()?;
+        if self.shutdown.is_cancelled() {
+            return Err(AppError::new("shutting_down", "서버가 종료 중입니다."));
+        }
+        self.transcription.begin().map_err(transcription_error)
+    }
+    pub(crate) async fn transcribe_audio(
+        &self,
+        job: crate::transcription::Job,
+        bytes: Vec<u8>,
+        mime: &str,
+    ) -> Result<crate::transcription::Transcript> {
+        self.ensure_workspace_current()?;
+        let result = self
+            .transcription
+            .transcribe(job, bytes, mime)
+            .await
+            .map_err(transcription_error)?;
+        self.ensure_workspace_current()?;
+        if self.shutdown.is_cancelled() {
+            return Err(AppError::new("shutting_down", "서버가 종료 중입니다."));
+        }
+        Ok(result)
     }
     fn sync_shared_ai(&self, inner: &mut Inner) -> Result<()> {
         let Some(path) = &self.shared_config else {
@@ -1647,6 +1727,10 @@ fn file_outcome(result: anyhow::Result<files::ExportResult>) -> files::ExportRes
         files: vec![],
         error: Some(error.to_string()),
     })
+}
+
+fn transcription_error(error: crate::transcription::Error) -> AppError {
+    AppError::new(error.code, error.message)
 }
 
 #[cfg(test)]

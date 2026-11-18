@@ -111,6 +111,9 @@ async function assertRepresentative(page) {
   }
   await expect(diagram(page,'jobflow').first().locator('svg')).toContainText('자료조회');
   await expect(diagram(page,'jobflow').last().locator('svg')).toContainText('열기조율자');
+  const structure=diagram(page,'mermaid').first();
+  await expect(structure).toHaveAttribute('data-diagram-status','ready');
+  await expect(structure.locator('svg')).toContainText('자료조회 시스템의 논리 경계');
   const observed=await observe(page);
   expect(observed.svg).toBeGreaterThanOrEqual(2);expect(observed.rawSource).toBe(false);
   expect(observed.documentWidth).toBeLessThanOrEqual(observed.viewport);
@@ -201,12 +204,12 @@ const hostileAppendix=(()=>{let fenced=false;return [
 async function assertHostileDocument(page,server) {
   await assertRepresentative(page);
   const mermaid=diagram(page,'mermaid');
-  await expect(mermaid).toHaveCount(4);
+  await expect(mermaid).toHaveCount(5);
   const nested=page.locator('.markdown .smart-callout').filter({hasText:'코드와 그림이 있는 설명'});
   await expect(nested.locator('code.language-javascript')).toHaveText('const literal = ":::info";');
   await expect(nested.locator('figure[data-diagram="mermaid"]')).toHaveAttribute('data-diagram-status','ready');
   await expect(nested.locator('svg')).toContainText('NestedStart');
-  const normal=mermaid.nth(1);
+  const normal=mermaid.filter({hasText:'시작'}).first();
   await expect(normal).toHaveAttribute('data-diagram-status','ready');
   await expect(normal.locator('svg')).toContainText('시작');
   await expect(mermaid.last()).toHaveAttribute('data-diagram-status','error');
@@ -215,7 +218,8 @@ async function assertHostileDocument(page,server) {
   await expect(page.locator('.markdown strong').filter({hasText:'뒤쪽 본문 보존'})).toHaveCount(1);
   const code=page.locator('.markdown pre code.language-html');
   await expect(code).toHaveText('<script>window.architalkCodeProbe=true</script>\n<img src=x onerror="window.architalkCodeProbe=true">');
-  await expect(page.locator('.markdown script,.markdown img,.markdown iframe,.markdown object,.markdown embed,.markdown foreignObject,.markdown form,.markdown button,.markdown input,.markdown source')).toHaveCount(0);
+  // Only the renderer's post-sanitization zoom controls may create buttons.
+  await expect(page.locator('.markdown script,.markdown img,.markdown iframe,.markdown object,.markdown embed,.markdown foreignObject,.markdown form,.markdown button:not(.document-diagram-controls > button),.markdown input,.markdown source')).toHaveCount(0);
   const unsafe=await page.locator('.markdown').evaluate(element=>{
     const attributes=[];
     for(const child of element.querySelectorAll('*'))for(const attr of child.attributes){

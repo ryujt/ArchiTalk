@@ -44,5 +44,9 @@
 | 문서별 응답·prefix·미래 ID·전체 조립 계약 | [document-stages-domain](document-stages-domain-20261118.md) | 단위/기존 계약47 통과, 최초 반례와 수정 보존 |
 | 순차 요청·DB 진행·재개·취소·최종 검증 | [document-stages-app](document-stages-app-20261118.md) | 소비자25·guard·강화2 표적 및 clippy 통과 |
 | 단계 진행 UI·schema3·전체 조립·설치 | [document-stages-integration](document-stages-integration-20261118.md) | Node44·Rust168·browser22·migration/구 바이너리·전역0.3.0 통과 |
+| 도표 전체 맞춤·확대·이동·리사이즈 | [viewer-diagram](viewer-diagram-20261118.md) | overflow 반례 후 Node4·browser8, 독립 file race4 통과 |
+| 파일 경계·공용 전사 비밀 설정·음성 API | [viewer-backend](viewer-backend-20261118.md) | HTTP6·local fake transport5·기존 파일/reset21 통과 |
+| 문서 목록 저장 창·탭·녹음·좌우 패널 | [viewer-workspace](viewer-workspace-20261118.md) | 실제 grid 회귀 수정, browser4·Node 표적 통과 |
+| 시스템 구성도·음성 소비자·통합·설치 | [viewer-integration](viewer-integration-20261118.md) | Rust180·Node60·mdview6·browser46 통과, 전역0.4.0 설치 확인 |
 
 최초 작업으로 참고할 이전 실행은 없었다. 후속 실행은 각 기록의 미검증·후속 조건을 먼저 확인한다.

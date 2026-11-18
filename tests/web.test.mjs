@@ -616,6 +616,34 @@ test('timeout settings use the new default only when the server value is absent'
   }finally{h.dispose();}
 });
 
+test('save preview keeps full document bodies collapsed and action footer outside its scroll body',async()=>{
+  const session=sessionFixture();session.drafts=[{id:'d1',input_revision:2,markdown:'# Existing document',reviewed:true,content_status:'draft'}];
+  const files=Array.from({length:10},(_,i)=>({relative_path:`설계-${i+1}.md`,content:`# Large source ${i+1}\n${'본문 '.repeat(1000)}`}));
+  const plan={id:'save-plan',document_revision:2,relative_directory:'docs/architecture/project',files};
+  const h=harness(async(path,options,body)=>path==='/api/v1/workspace'?{project_name:'save',sessions:[session],runs:[],active_run:null,exports:[],context_files:[]}:path.endsWith('/exports')&&body?.payload.mode==='preview'?{plan,export:{id:plan.id,status:'preview'}}:session);
+  try{
+    await eventually(()=>h.app.state.scene==='recovery');h.click('review');h.click('save-preview');await eventually(()=>h.app.state.plan&&!h.app.state.busy);
+    const html=h.doc.getElementById('scene-dialog').innerHTML;
+    assert.match(html,/save-dialog-body/);assert.match(html,/save-dialog-footer/);
+    assert.equal((html.match(/<details class="plan-preview">/g)||[]).length,10);
+    assert.doesNotMatch(html,/<details class="plan-preview"[^>]*\bopen\b/);
+    assert.ok(html.lastIndexOf('</details>')<html.indexOf('save-dialog-footer'));
+    assert.match(html,/<\/div><div class="dialog-footer save-dialog-footer">/);
+  }finally{h.dispose();}
+});
+
+test('workspace sidebars can close and reopen independently without altering project state',async()=>{
+  const session=sessionFixture();const h=harness(async path=>path==='/api/v1/workspace'?{project_name:'panels',sessions:[session],runs:[],active_run:null,exports:[],context_files:[]}:session);
+  try{
+    await eventually(()=>h.app.state.scene==='recovery');const original=structuredClone(h.app.state.session);
+    h.click('toggle-sidebar');assert.equal(h.app.state.leftCollapsed,true);assert.equal(h.doc.getElementById('sidebar-toggle').attributes['aria-expanded'],'false');
+    h.click('toggle-sidebar');assert.equal(h.app.state.leftCollapsed,false);assert.equal(h.doc.getElementById('sidebar-toggle').attributes['aria-expanded'],'true');
+    h.click('toggle-info');assert.equal(h.app.state.rightCollapsed,true);assert.equal(h.doc.getElementById('info-toggle').attributes['aria-expanded'],'false');
+    h.click('toggle-info');assert.equal(h.app.state.rightCollapsed,false);assert.equal(h.doc.getElementById('info-toggle').attributes['aria-expanded'],'true');
+    assert.deepEqual(h.app.state.session,original);assert.equal(h.requests.filter(request=>request.options.method!=='GET').length,0);
+  }finally{h.dispose();}
+});
+
 function stageFixture(session, count=3) {
   const kinds=['drivers','quality_scenarios','alternatives','decisions','delivery','jobflow','state','screen_layout','navigation','architecture'];
   return {id:'generation-1',input_revision:session.design_revision,input_hash:'input',contract_hash:'contract',language:'ko',draft_id:null,

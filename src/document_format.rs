@@ -104,6 +104,7 @@ pub fn validate_profile(markdown: &str, profile: ValidationProfile) -> Result<()
     let mut section = None;
     let mut active_h2 = None;
     let mut method_r_blocks = [0; 2];
+    let mut system_structure = false;
     let mut callout: Option<(bool, bool)> = None;
     let mut has_callout = false;
     let mut has_table = false;
@@ -113,6 +114,27 @@ pub fn validate_profile(markdown: &str, profile: ValidationProfile) -> Result<()
         if let Some((marker, length, language)) = fence(line) {
             let start = i + 1;
             i = fence_end(&lines, i)?;
+            if profile == ValidationProfile::Principal
+                && active_h2 == Some("Method-R system design")
+                && callout.is_none()
+                && language == "mermaid"
+                && !line.starts_with(' ')
+                && !lines[i].starts_with(' ')
+            {
+                // Only recognize a real static graph in this section. Full
+                // Mermaid syntax/meaning is rendered/reviewed separately.
+                let body: Vec<_> = lines[start..i]
+                    .iter()
+                    .map(|line| line.trim())
+                    .filter(|line| !line.is_empty() && !line.starts_with("%%"))
+                    .collect();
+                system_structure |= body.first().is_some_and(|header| {
+                    let tokens: Vec<_> = header.trim_end_matches(';').split_whitespace().collect();
+                    tokens.len() == 2
+                        && matches!(tokens[0], "flowchart" | "graph")
+                        && matches!(tokens[1], "LR" | "RL" | "TD" | "TB" | "BT")
+                }) && body.iter().skip(1).any(|line| has_structure_edge(line));
+            }
             if let Some(which) = LANGUAGES.iter().position(|l| *l == language) {
                 if line.starts_with(' ')
                     || lines[i].starts_with(' ')
@@ -223,15 +245,17 @@ pub fn validate_profile(markdown: &str, profile: ValidationProfile) -> Result<()
         } else if let Some((_, content)) = callout.as_mut() {
             *content |= !line.trim().is_empty();
         } else {
-            if let Some(name) = line.strip_prefix("## ") {
-                active_h2 = Some(name.trim());
-                section = SECTIONS.iter().position(|s| *s == name.trim());
-                if let Some(s) = section {
-                    headings[s] = true;
+            if let Some((level, name)) = atx_heading(line) {
+                if level == 2 {
+                    active_h2 = Some(name);
+                    section = SECTIONS.iter().position(|s| *s == name);
+                    if let Some(s) = section {
+                        headings[s] = true;
+                    }
+                } else if level == 1 {
+                    section = None;
+                    active_h2 = None;
                 }
-            } else if line.starts_with("# ") {
-                section = None;
-                active_h2 = None;
             }
             if let Some(s) = section {
                 prose[s].push(line);
@@ -256,6 +280,11 @@ pub fn validate_profile(markdown: &str, profile: ValidationProfile) -> Result<()
     if profile == ValidationProfile::Principal && method_r_blocks[0] == 0 {
         return Err(invalid("Method-R macro design needs its scope jobflow DSL"));
     }
+    if profile == ValidationProfile::Principal && !system_structure {
+        return Err(invalid(
+            "Method-R system design needs its system structure Mermaid flowchart",
+        ));
+    }
     let required: Vec<usize> = match profile {
         ValidationProfile::Legacy => (0..4).collect(),
         ValidationProfile::Diagram(kind) => vec![kind.index()],
@@ -278,6 +307,49 @@ pub fn validate_profile(markdown: &str, profile: ValidationProfile) -> Result<()
         }
     }
     Ok(())
+}
+
+// Ignore Mermaid node/edge labels and comments before recognizing edges. This
+// deliberately does not claim to validate all Mermaid grammar or semantics.
+fn has_structure_edge(line: &str) -> bool {
+    let mut outside = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut closing = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(character) = chars.next() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '"' | '`' | '|') || (character == '\'' && closing.is_empty()) {
+            quote = Some(character);
+        } else if character == '%' && chars.peek() == Some(&'%') {
+            break;
+        } else if let Some(end) = match character {
+            '[' => Some(']'),
+            '(' => Some(')'),
+            '{' => Some('}'),
+            _ => None,
+        } {
+            closing.push(end);
+        } else if closing.last() == Some(&character) {
+            closing.pop();
+        } else if closing.is_empty() {
+            outside.push(character);
+        }
+    }
+    ["-->", "---", "-.->", "==>", "<-->"].iter().any(|arrow| {
+        outside
+            .split_once(arrow)
+            .is_some_and(|(from, to)| !from.trim().is_empty() && !to.trim().is_empty())
+    })
 }
 
 // CommonMark HTML block starts can swallow otherwise valid-looking heading and

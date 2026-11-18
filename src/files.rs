@@ -140,6 +140,36 @@ impl Directory {
     pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
         self.file.as_raw_fd()
     }
+    pub(crate) fn metadata(&self) -> Result<fs::Metadata> {
+        Ok(self.file.metadata()?)
+    }
+    /// Replace a private shared secret atomically, never traversing a child link.
+    pub(crate) fn replace_private_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let temporary = format!(".architalk-secret-{}", uuid::Uuid::new_v4());
+        let mut file = self.create_private_file(&temporary)?;
+        let temporary_c = Self::name(&temporary)?;
+        let name_c = Self::name(name)?;
+        let result = (|| -> Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            if unsafe {
+                libc::renameat(
+                    self.raw_fd(),
+                    temporary_c.as_ptr(),
+                    self.raw_fd(),
+                    name_c.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            self.sync()
+        })();
+        unsafe {
+            libc::unlinkat(self.raw_fd(), temporary_c.as_ptr(), 0);
+        }
+        result
+    }
     /// Remove an owned scratch subtree through directory descriptors only.
     /// A replaced top-level name is preserved, and symlinks are unlinked rather
     /// than followed. Callers also verify their pinned ancestor identities.
@@ -446,6 +476,38 @@ impl ProjectFiles {
     }
     pub fn read_selected(&self, selected: &[String]) -> Result<Vec<EvidenceFile>> {
         read_selected_at(&self.root, selected)
+    }
+    /// Viewer browsing is deliberately separate from AI evidence selection.
+    pub fn viewer_tree(&self) -> Result<ViewerTree> {
+        let mut budget = ViewerBudget::default();
+        let entries = viewer_walk(&self.root, "", 0, &mut budget)?;
+        Ok(ViewerTree {
+            entries,
+            files: budget.files,
+            truncated: budget.truncated,
+        })
+    }
+    pub fn viewer_read(&self, path: &str) -> Result<ViewerContent> {
+        let parts = viewer_parts(path)?;
+        let mut current = self.root.try_clone()?;
+        let mut canonical = Vec::new();
+        for part in &parts[..parts.len() - 1] {
+            let part = viewer_spelling(&current, part)?;
+            current = current.open_dir(&part)?;
+            canonical.push(part);
+        }
+        let name = viewer_spelling(&current, parts.last().unwrap())?;
+        let kind = viewer_kind(&name).ok_or_else(|| anyhow!("file is not viewable"))?;
+        let content = viewer_text(current.open_file(&name, false)?)?;
+        canonical.push(name.clone());
+        Ok(ViewerContent {
+            path: canonical.join("/"),
+            name,
+            kind,
+            size: content.len() as u64,
+            hash: hash_bytes(content.as_bytes()),
+            content,
+        })
     }
     pub fn preview(
         &self,
@@ -996,4 +1058,280 @@ fn read_selected_at(dir: &Directory, selected: &[String]) -> Result<Vec<Evidence
         });
     }
     Ok(evidence)
+}
+
+// The viewer never follows symlinks or relaxes evidence selection. In particular,
+// the filesystem's original Unicode spelling is retained (macOS may use NFD).
+pub const VIEWER_FILE_LIMIT: usize = 2 * 1024 * 1024;
+const VIEWER_MAX_FILES: usize = 2000;
+const VIEWER_MAX_DEPTH: usize = 12;
+const VIEWER_MAX_ENTRIES: usize = 20_000;
+const VIEWER_SCAN_BYTES: usize = 32 * 1024 * 1024;
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ViewerKind {
+    Markdown,
+    Text,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ViewerFile {
+    pub path: String,
+    pub name: String,
+    pub kind: ViewerKind,
+    pub size: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ViewerEntry {
+    pub path: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub entry_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ViewerKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ViewerEntry>,
+}
+#[derive(Debug, Serialize)]
+pub struct ViewerTree {
+    pub entries: Vec<ViewerEntry>,
+    pub files: Vec<ViewerFile>,
+    pub truncated: bool,
+}
+#[derive(Debug, Serialize)]
+pub struct ViewerContent {
+    pub path: String,
+    pub name: String,
+    pub kind: ViewerKind,
+    pub content: String,
+    pub size: u64,
+    pub hash: String,
+}
+#[derive(Default)]
+struct ViewerBudget {
+    files: Vec<ViewerFile>,
+    entries: usize,
+    bytes: usize,
+    truncated: bool,
+}
+fn viewer_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.len() <= 255
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+        && !excluded(name)
+        && !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "coverage"
+                | "__pycache__"
+                | "venv"
+                | "env"
+                | "out"
+                | "tmp"
+                | "temp"
+                | "cache"
+                | "logs"
+                | "auth.json"
+                | "auth.toml"
+                | "auth.yaml"
+                | "auth.yml"
+                | "credentials"
+                | "passwd"
+                | "shadow"
+        )
+        && !name.to_ascii_lowercase().contains("apikey")
+        && !name.to_ascii_lowercase().contains("api_key")
+}
+fn viewer_parts(path: &str) -> Result<Vec<String>> {
+    let parts: Vec<_> = path.split('/').map(str::to_owned).collect();
+    if path.len() > 4096
+        || parts.len() > VIEWER_MAX_DEPTH + 1
+        || parts.iter().any(|p| !viewer_name(p))
+    {
+        bail!("file path is not viewable");
+    }
+    Ok(parts)
+}
+fn viewer_spelling(dir: &Directory, requested: &str) -> Result<String> {
+    let names = dir.names()?;
+    if names.iter().any(|name| name == requested) {
+        return Ok(requested.to_owned());
+    }
+    let normalized: String = requested.nfc().collect();
+    let mut equivalents = names
+        .into_iter()
+        .filter(|name| name.nfc().eq(normalized.chars()));
+    let name = equivalents
+        .next()
+        .ok_or_else(|| anyhow!("file unavailable"))?;
+    if equivalents.next().is_some() || !viewer_name(&name) {
+        bail!("ambiguous file spelling");
+    }
+    Ok(name)
+}
+fn viewer_kind(name: &str) -> Option<ViewerKind> {
+    let lower = name.to_ascii_lowercase();
+    let extension = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    if matches!(extension, "md" | "markdown" | "mdown") {
+        return Some(ViewerKind::Markdown);
+    }
+    if matches!(
+        lower.as_str(),
+        "dockerfile" | "makefile" | "license" | "readme"
+    ) || matches!(
+        extension,
+        "txt"
+            | "rst"
+            | "go"
+            | "js"
+            | "mjs"
+            | "cjs"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "py"
+            | "java"
+            | "kt"
+            | "kts"
+            | "c"
+            | "h"
+            | "cc"
+            | "cpp"
+            | "hpp"
+            | "cs"
+            | "rs"
+            | "rb"
+            | "php"
+            | "swift"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "sql"
+            | "lua"
+            | "r"
+            | "pl"
+            | "scala"
+            | "dart"
+            | "vue"
+            | "svelte"
+            | "html"
+            | "htm"
+            | "css"
+            | "scss"
+            | "less"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "ini"
+            | "conf"
+            | "cfg"
+            | "properties"
+            | "xml"
+            | "gradle"
+            | "mod"
+            | "sum"
+            | "lock"
+    ) {
+        Some(ViewerKind::Text)
+    } else {
+        None
+    }
+}
+fn viewer_text(file: File) -> Result<String> {
+    let metadata = file.metadata()?;
+    if metadata.len() > VIEWER_FILE_LIMIT as u64 || metadata.nlink() != 1 {
+        bail!("viewable file exceeds 2 MiB or has external hard links");
+    }
+    let mut bytes = Vec::new();
+    file.take(VIEWER_FILE_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > VIEWER_FILE_LIMIT || bytes.contains(&0) {
+        bail!("file is too large or binary");
+    }
+    String::from_utf8(bytes).context("file is not UTF-8 text")
+}
+fn viewer_walk(
+    dir: &Directory,
+    prefix: &str,
+    depth: usize,
+    budget: &mut ViewerBudget,
+) -> Result<Vec<ViewerEntry>> {
+    let mut entries = Vec::new();
+    for name in dir.names()? {
+        if budget.entries >= VIEWER_MAX_ENTRIES
+            || budget.files.len() >= VIEWER_MAX_FILES
+            || budget.bytes >= VIEWER_SCAN_BYTES
+        {
+            budget.truncated = true;
+            break;
+        }
+        budget.entries += 1;
+        if !viewer_name(&name) {
+            continue;
+        }
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if let Ok(child) = dir.open_dir(&name) {
+            if depth >= VIEWER_MAX_DEPTH {
+                budget.truncated = true;
+                continue;
+            }
+            let children = viewer_walk(&child, &path, depth + 1, budget)?;
+            if !children.is_empty() {
+                entries.push(ViewerEntry {
+                    path,
+                    name,
+                    entry_type: "directory",
+                    kind: None,
+                    size: None,
+                    children,
+                });
+            }
+        } else if let Some(kind) = viewer_kind(&name) {
+            let Ok(file) = dir.open_file(&name, false) else {
+                continue;
+            };
+            let size = file.metadata()?.len();
+            if size > VIEWER_FILE_LIMIT as u64 {
+                continue;
+            }
+            if budget.bytes.saturating_add(size as usize) > VIEWER_SCAN_BYTES {
+                budget.truncated = true;
+                break;
+            }
+            let Ok(content) = viewer_text(file) else {
+                continue;
+            };
+            if budget.bytes.saturating_add(content.len()) > VIEWER_SCAN_BYTES {
+                budget.truncated = true;
+                break;
+            }
+            budget.bytes += content.len();
+            let size = content.len() as u64;
+            budget.files.push(ViewerFile {
+                path: path.clone(),
+                name: name.clone(),
+                kind,
+                size,
+            });
+            entries.push(ViewerEntry {
+                path,
+                name,
+                entry_type: "file",
+                kind: Some(kind),
+                size: Some(size),
+                children: Vec::new(),
+            });
+        }
+    }
+    Ok(entries)
 }

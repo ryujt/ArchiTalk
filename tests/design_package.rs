@@ -11,6 +11,48 @@ fn sample() -> DesignPackage {
     serde_json::from_str(SAMPLE).unwrap()
 }
 
+#[test]
+fn principal_system_structure_requires_a_real_scoped_flowchart() {
+    let mut package = sample();
+    let chart = "```mermaid\nflowchart LR\n    User[\"사용자\"] -->|자료 요청| Reader[\"자료조회 / 과업 상태 소유\"]\n    Reader -->|읽기 계약| Source[\"자료읽기 / 자료 원본\"]\n```";
+    // Keep this test usable before and after the representative fixture is upgraded.
+    if let Some(start) = package.markdown.find("```mermaid\nflowchart LR") {
+        let end = package.markdown[start + 3..].find("\n```").unwrap() + start + 7;
+        package.markdown.replace_range(start..end, "");
+    }
+    let marker = "## Method-R system design\n";
+    let base = package.markdown.clone();
+    package.markdown = base.replacen(marker, &format!("{marker}\n{chart}\n"), 1);
+    validate(&package).unwrap();
+    package.markdown = base.replacen(
+        marker,
+        &format!("{marker}\n```mermaid\nflowchart LR\nA[User's workspace] --> B[Reader]\n```\n"),
+        1,
+    );
+    validate(&package).unwrap();
+    for wrong in [
+        String::new(),
+        "```mermaid\nflowchart LR\n```".into(),
+        "```mermaid\nsequenceDiagram\nUser->>Reader: open\n```".into(),
+        "```mermaid\nflowchart LR\nOnly[\"label --> not an edge\"]\n```".into(),
+        format!("Static system prose.\n  ## Appendix\n{chart}"),
+        format!("<!--\n{chart}\n-->"),
+        format!("````markdown\n{chart}\n````"),
+        format!(":::info title=\"구성도 예시\"\n{chart}\n:::"),
+    ] {
+        package.markdown = base.replacen(marker, &format!("{marker}\n{wrong}\n"), 1);
+        assert!(
+            validate(&package).is_err(),
+            "accepted missing/fake system chart: {wrong}"
+        );
+    }
+    package.markdown = format!("{base}\n## Appendix\n{chart}\n");
+    assert!(
+        validate(&package).is_err(),
+        "an appendix chart cannot satisfy system design"
+    );
+}
+
 fn module_link(package: &mut DesignPackage, target: &str) {
     let marker = "## Method-R module design\n";
     let start = package.markdown.find(marker).unwrap() + marker.len();

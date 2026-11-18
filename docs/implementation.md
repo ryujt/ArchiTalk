@@ -1,4 +1,4 @@
-# ArchiTalk 0.3 구현 안내
+# ArchiTalk 0.4 구현 안내
 
 기준 설계는 [2026-11-17 TO-BE](design/20261117-190055/to-be/system-design-to-be.md)다. 설계 문서는 당시의 목표와 대안을 보존하고, 이 문서와 [README](../README.md)는 실제 제품 계약과 검증 범위를 설명한다.
 
@@ -22,7 +22,7 @@ DB schema는 3이다. v1/v2에서 이행하기 전에 SQLite online backup으로
 
 ## 공개 API
 
-경로 앞에는 `/api/v1`을 붙인다. 변경 요청은 `{command_id, expected_revision, payload}`를 사용한다. 동일 command ID의 receipt를 revision 검사보다 먼저 확인하며, 다른 payload로 재사용하면 거부한다. `revision`은 명령 동시성, `design_revision`은 의미 입력 버전이다.
+경로 앞에는 `/api/v1`을 붙인다. 프로젝트 변경 요청은 `{command_id, expected_revision, payload}`를 사용한다. 동일 command ID의 receipt를 revision 검사보다 먼저 확인하며, 다른 payload로 재사용하면 거부한다. `revision`은 명령 동시성, `design_revision`은 의미 입력 버전이다. 별도의 전사 설정·전사 요청은 아래의 직접 JSON/multipart 계약을 사용하고 프로젝트 snapshot이나 receipt에 기록하지 않는다.
 
 | 경로 | 계약 |
 | --- | --- |
@@ -43,8 +43,23 @@ DB schema는 3이다. v1/v2에서 이행하기 전에 SQLite online backup으로
 | `GET /sessions/{id}/exports/{id}` | 정확한 파일별 저장 결과 확인 |
 | `GET/PATCH /settings` | 설정과 알려진 모델·생각 수준 예시(`choices`) 조회 / `payload.settings` 전체 갱신 |
 | `POST /settings/diagnostics` | 모델 호출 없는 설치·버전·필수 옵션 진단 |
+| `GET /files/tree` | 보기 가능한 재귀 `entries`와 평면 `files`, 잘림 여부·프로젝트 표시 경로. Markdown/지원 텍스트만,2MiB/파일·2000파일·깊이12 등 탐색 예산 적용 |
+| `GET /files/read?path=...` | `{path,name,kind,content,size,hash,absolute_path}`. 고정 프로젝트 경계·허용 이름·UTF-8·크기·no-follow 재검사 |
+| `GET /transcription/settings` | `{configured,model,max_audio_bytes,timeout_seconds,key_source}`. 원문 키는 반환하지 않음 |
+| `PATCH /transcription/key` | 직접 `{api_key?,model?}`. 키 생략은 유지, null/빈 문자열은 삭제. 공용 비밀 파일만 갱신 |
+| `POST /transcription` | `audio` 한 필드의 multipart. `{text,model}` 반환.20MiB/120초, 동시1개, 자동 retry 없음 |
 
 `202`는 접수이며 생성 완료가 아니다. SSE delta는 임시 데이터이고 마지막 확정 snapshot이 기준이다. feed를 놓치면 cursor replay 또는 snapshot polling으로 복구한다. UI는 불명확한 저장 응답을 같은 export ID로 조회해 확인하고 새로운 저장을 겹치지 않는다.
+
+## 프로젝트 문서 보기와 녹음
+
+파일 탐색은 기존 AI 자료 선택과 별개다. 탐색은 총32MiB·20,000entry 예산에서 잘릴 수 있고 단일 디렉터리의 기존10,000entry 상한 초과는 `file_unavailable`로 거절한다. 탐색 목록을 읽거나 파일을 열어도 해당 파일을 AI 대화 문맥에 추가하지 않는다. Markdown은 기존 정화 renderer로, 코드·HTML 등은 실행 없이 텍스트로 표시한다. 숨김/민감 파일·symlink·hardlink·비 UTF-8·바이너리와 dependency/build 폴더는 제외한다. 원래 파일명의 Unicode 표현을 보존하고 브라우저 링크는 서버 카탈로그 안에서만 NFC 대응한다. 상대 링크의 `..`는 프로젝트 안으로 해석될 때만 허용하며 절대 경로·외부 자원 요청으로 바꾸지 않는다.
+
+파일 트리·중복 없는 문서 탭·각 읽기 위치·채팅 탭과 우클릭 복사 메뉴는 페이지 메모리에서 관리한다. 접힌 좌우 패널의 복원 버튼은 상단에 남긴다. 패널 크기가 바뀌면 도표도 재맞춤하며 확대·이동에 내부 스크롤바를 사용하지 않는다. 전체 저장 modal은 파일 목록만 기본으로 표시하고 원문은 접힌 details에 둔다. header/body/footer를 나누어 긴 원문이 저장 버튼을 밀어내지 않는다.
+
+녹음은 설정의 키 존재를 확인한 뒤에만 마이크 권한을 요청한다. 녹음 중 문서 열기·클릭·선택·복사를 파일/제목/경과시간과 함께 메모리에 기록한다. 종료 후에는 음성만 고정 OpenAI Audio API로 전송하고 전사와 문서 위치 기록을 브라우저에서 결합하여 클립보드에 쓴다. 클립보드 거부 시 수동 복사 결과를 표시한다. 문서 수정이나 AI 작업을 자동 실행하지 않는다. 페이지 종료·프로젝트 reset 때 마이크 track·파일 요청·전사 요청을 중단하고 지연 결과를 무시한다. 오디오·전사·위치 기록의 디스크 보관은 없다.
+
+키와 전사 모델은 공용 config의 형제 파일 `transcription-secrets.toml`에 별도로 보관한다. 권한0600·소유자·no-follow를 확인하고 atomic 교체하며 일반 `Settings`의 Serialize/Debug·프로젝트 snapshot·receipt에 넣지 않는다. 환경변수 `OPENAI_API_KEY`는 파일 키가 없을 때 대체로 사용할 수 있다. 파일 키를 삭제해도 환경변수 키가 있으면 `configured:true,key_source:environment`로 표시한다. 격리 `App::open`은 실제 공용 파일과 환경 키를 읽지 않는다. 기본 전사 모델은 `gpt-transcribe`이며 UI는 녹음 종료 후 명시적으로 POST 요청을 보내며 이때 원격 API를 호출한다. 연결10초·전체120초·응답1MiB·오디오20MiB 제한, redirect/자동 retry 금지와 reset/shutdown 취소를 적용한다. [공식 API](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create)를 기준으로 음성의 실제 MIME/컨테이너를 검사한다.
 
 ## 대화·검토·저장
 
@@ -57,6 +72,7 @@ DB schema는 3이다. v1/v2에서 이행하기 전에 SQLite online backup으로
 - 중간 결과는 Draft·승인·export 대상이 아니다. 마지막 주 문서가 전체 패키지 검증까지 통과해야 기존 Draft와 전체 critic 경로에 넘긴다. 실패/중단 뒤 자동 재개는 없고 종료 미확인 게이트를 유지한다. 완료 문서의 내용을 바꾸려면 새 generation을 시작하며, 마지막 전체 연결 검증 실패에도 앞 문서를 보존하고 재시도/명시 restart 선택을 제공한다.
 - 비판 검토에는 주 문서와 상세 문서 전체를 전달한다. 문맥 제한을 넘으면 일부를 잘라 검토하지 않고 명시적으로 실패시킨다. 이미 완성한 설계는 보존하고 검토 실패를 구분한다. 자료가 부족하면 가정·미정·조건부 대안을 남기도록 하며, 정량 목표나 사용자의 승인을 만들어 내지 않도록 지시한다. 구조 검사는 설계 내용의 정확성 보장이 아니다.
 - 검토 UI의 문서 종류 선택은 서버 카탈로그와 실제 초안을 조합한다. 카탈로그에 있는 파일 링크만 종류 전환과 로컬 anchor 이동으로 처리한다. 제목 ID는 원문 HTML ID를 신뢰하지 않고 정화 후 생성한다. Markdown·SmartMD·Mermaid와 4종 DSL은 내장 자산으로 표시하고, 원문 보기와 도표별 오류를 제공한다. 문서와 생성 SVG는 따로 정화한다.
+- 새 주 문서의 `Method-R system design`에는 시스템 구성도 Mermaid flowchart가 필요하다. 실제 절·도표 연결 유무를 검사하고 구성요소 책임·상태/자료 소유자·화살표 계약은 prompt와 독립 검토로 확인한다. Method-R 매크로/모듈 jobflow와 기존4종 상세 DSL을 대체하지 않으며10종 문서 수와 과거 저장 초안은 유지한다.
 - 기본 coverage와 결제/민감 데이터/되돌릴 수 없는 변경 overlay를 적용한다. 범위 크기와 실패 영향을 분리하고, 중요한 미정/위험 질문을 코드가 우선한다. v1 pack은 내장 정책이며 외부 실행 플러그인은 없다.
 - AI가 추출한 내용은 해석/가정/제안으로 남긴다. 근거 ID와 원문 인용을 확인하며, 사용자 사실로 자동 승격하지 않는다. 최신 답변이 모름·추천·보류이면 이를 잘라 인용해 확정 수정의 근거로 사용할 수 없다.
 - 요구·진술·결정 수정은 새 버전과 `supersedes` 연결을 만들고 이전 근거를 보존한다. 과거 값을 익명 신규 항목으로 부활시키지 않는다. 연결된 결정은 변경 영향을 재검토한다.

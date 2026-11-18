@@ -9,3 +9,4 @@ pub mod files;
 pub mod http;
 pub mod model;
 pub mod storage;
+pub mod transcription;
