@@ -113,15 +113,15 @@ test('settings forms preserve trusted executables/profiles and set per-backend/r
 
 test('request time limits accept whole seconds within bounds and preserve omitted legacy form values',()=>{
   const original=structuredClone(settings);
-  for(const seconds of ['10','300','600']) {
+  for(const seconds of ['10','300','601','1800','3600']) {
     const changed=settingsFromValues(settings,{'default-backend':'claude','timeout-seconds':seconds});
     assert.equal(changed.ai.timeout_seconds,Number(seconds));
     assert.equal(changed.ai.backends.codex.executable,settings.ai.backends.codex.executable);
     assert.equal(changed.ai.backends.codex.profile,settings.ai.backends.codex.profile);
   }
   assert.equal(settingsFromValues(settings,{'default-backend':'claude'}).ai.timeout_seconds,180);
-  for(const seconds of ['', ' ', '9', '601', '-10', '10.5', 'NaN', 'Infinity', 'not-a-number']) {
-    assert.throws(()=>settingsFromValues(settings,{'timeout-seconds':seconds}),error=>error instanceof ApiError&&error.code==='INVALID_SETTINGS'&&/10~600.*정수/.test(error.message),seconds);
+  for(const seconds of ['', ' ', '9', '3601', '-10', '10.5', 'NaN', 'Infinity', 'not-a-number']) {
+    assert.throws(()=>settingsFromValues(settings,{'timeout-seconds':seconds}),error=>error instanceof ApiError&&error.code==='INVALID_SETTINGS'&&/10~3600.*정수/.test(error.message),seconds);
   }
   assert.deepEqual(settings,original,'settings changes must not alter an active run or its source settings');
 });
@@ -552,4 +552,66 @@ test('conversation retry respects latest kind, status, and confirmed termination
       if(!eligible){h.click('retry-conversation');assert.equal(h.requests.filter(r=>r.options.method==='POST').length,0);}
     }finally{h.dispose();}
   }
+});
+
+test('timeout recovery shows the failed run limit and focuses settings without changing project content',async()=>{
+  let session=sessionFixture();session.drafts=[{id:'d1',input_revision:2,markdown:'# Existing draft',documents:[{kind:'state',markdown:'# Existing state'}],reviewed:true,content_status:'draft'}];
+  let run={id:'timed-out-design',session_id:session.id,kind:'design',status:'failed',process_termination:'confirmed',effective_settings:{timeout_seconds:300},error:{code:'timeout',message:'AI CLI reached its wall-time limit.'}};
+  const current=structuredClone(settings);current.ai.timeout_seconds=1800;
+  const workspace=()=>({project_name:'timeout',sessions:[session],runs:[run],active_run:run.status==='running'?run:null,exports:[],context_files:[],settings:current,document_types:[{kind:'architecture',filename:'아키텍처-설계.md',title:'설계'},{kind:'state',filename:'상태도.md',title:'상태도'}]});
+  const original=structuredClone(session);
+  const h=harness(async(path,options,body)=>{
+    if(path==='/api/v1/workspace')return workspace();
+    if(path==='/api/v1/settings')return {settings:current,revision:7,diagnostics:[],choices:{}};
+    if(path.endsWith('/draft')&&options.method==='POST'){
+      assert.deepEqual(body.payload,{});assert.equal(body.expected_revision,4);
+      run={...run,id:'new-design',status:'running',process_termination:'pending',effective_settings:{timeout_seconds:1800},error:null};session={...session,revision:5,active_run_id:run.id};return {session,run};
+    }
+    return path.includes('/runs/')?run:session;
+  });
+  try{
+    await eventually(()=>h.app.state.scene==='recovery');
+    let html=h.doc.getElementById('workspace-content').innerHTML;assert.match(html,/300초/);assert.match(html,/시간 제한 조정/);assert.match(html,/초안 다시 생성/);assert.doesNotMatch(html,/1800초/);
+    await h.app.refresh({keep:false});assert.equal(h.app.state.scene,'error');
+    html=h.doc.getElementById('workspace-content').innerHTML;assert.match(html,/작업 시간이 초과됐어요/);assert.match(html,/300초/);assert.match(html,/<details class="error-detail">/);
+    h.app.state.answer='보내지 않은 수정 의견';h.app.state.selectedDraft='d1';h.app.state.selectedDocument='state';
+    h.click('timeout-settings');await eventually(()=>h.app.state.modal==='settings'&&!h.app.state.busy);
+    assert.equal(h.doc.activeElement.id,'timeout-seconds');assert.match(h.doc.getElementById('scene-dialog').innerHTML,/max="3600"/);assert.match(h.doc.getElementById('scene-dialog').innerHTML,/value="1800"/);
+    h.click('close-modal');assert.equal(h.app.state.scene,'error');assert.equal(h.app.state.selectedDocument,'state');assert.equal(h.app.state.selectedDraft,'d1');assert.equal(h.app.state.answer,'보내지 않은 수정 의견');assert.deepEqual(h.app.state.session,original);
+    assert.equal(h.requests.filter(request=>request.options.method==='POST').length,0,'opening or cancelling settings must not retry');
+    h.click('generate');h.click('generate');await eventually(()=>h.app.state.scene==='generating'&&!h.app.state.busy);
+    assert.equal(h.app.state.runScene,'review');assert.equal(h.app.state.selectedDocument,'state');assert.equal(h.app.state.answer,'보내지 않은 수정 의견');assert.deepEqual(h.app.state.session.messages,original.messages);assert.deepEqual(h.app.state.session.drafts,original.drafts);
+    html=h.doc.getElementById('workspace-content').innerHTML;assert.match(html,/pending-turn/);assert.match(html,/요청당 시간 제한: 1800초/);assert.match(html,/다음 작업/);
+    assert.equal(h.requests.filter(request=>request.path.endsWith('/draft')&&request.options.method==='POST').length,1);assert.equal(h.requests.filter(request=>request.path.endsWith('/messages')||request.path.endsWith('/conversation/retry')).length,0);
+  }finally{h.dispose();}
+});
+
+test('timeout recovery keeps review and conversation actions distinct and honors unconfirmed termination',async()=>{
+  for(const [kind,termination,limit] of [['critic','confirmed',300],['conversation','confirmed',120],['design','unknown',10],['design','confirmed',null]]){
+    const session=sessionFixture();session.drafts=[{id:'d1',input_revision:2,markdown:'# Preserved draft',reviewed:true,content_status:'draft'}];
+    const run={id:'timeout-run',session_id:session.id,kind,status:'failed',process_termination:termination,effective_settings:limit?{timeout_seconds:limit}:{},error:{code:'timeout',message:'AI CLI reached its wall-time limit.'}};
+    const h=harness(async path=>path==='/api/v1/workspace'?{project_name:'timeout kinds',sessions:[session],runs:[run],active_run:termination==='unknown'?run:null,exports:[],context_files:[]}:path.includes('/runs/')?run:session);
+    try{
+      await eventually(()=>h.app.state.scene==='recovery');
+      if(termination==='unknown'){
+        const html=h.doc.getElementById('workspace-content').innerHTML;assert.match(html,/수동 종료 확인/);assert.doesNotMatch(html,/>초안 다시 생성</);h.click('generate');assert.equal(h.requests.filter(request=>request.options.method==='POST').length,0);
+      }else{
+        await h.app.refresh({keep:false});const html=h.doc.getElementById('workspace-content').innerHTML;
+        if(kind==='critic'){assert.match(html,/class="primary" data-action="review"[^>]*>완성된 초안 보기/);assert.doesNotMatch(html,/>초안 다시 생성</);}
+        if(kind==='conversation'){assert.match(html,/data-action="retry-conversation"/);assert.doesNotMatch(html,/>초안 다시 생성</);}
+        if(limit===null)assert.doesNotMatch(html,/300초|1800초/,'a missing run limit must not be inferred from defaults');
+      }
+    }finally{h.dispose();}
+  }
+});
+
+test('timeout settings use the new default only when the server value is absent',async()=>{
+  const current=structuredClone(settings);delete current.ai.timeout_seconds;
+  const h=harness(async path=>path==='/api/v1/workspace'?{project_name:'missing timeout',sessions:[],runs:[],exports:[],context_files:[]}:path==='/api/v1/settings'?{settings:current,revision:0,diagnostics:[]}:null);
+  try{
+    await eventually(()=>h.app.state.scene==='welcome');h.click('settings');await eventually(()=>h.app.state.modal==='settings'&&!h.app.state.busy);
+    assert.match(h.doc.getElementById('scene-dialog').innerHTML,/id="timeout-seconds"[^>]+value="1800"/);
+    assert.match(h.doc.getElementById('scene-dialog').innerHTML,/요청마다 제한을 따로/);
+    assert.equal(h.requests.filter(request=>request.options.method==='POST'||request.options.method==='PATCH').length,0);
+  }finally{h.dispose();}
 });

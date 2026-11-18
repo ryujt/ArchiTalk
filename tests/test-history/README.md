@@ -38,5 +38,8 @@
 | 응답 보정·실패 원자성·재시도 UI/브라우저 | [question-workflow](question-workflow-20261118.md) | subprocess3·Node29·browser4 통과, 초기 fixture/도구 실패 보존 |
 | 원문 보존·명시적 대화 retry API | [conversation-retry](conversation-retry-20261118.md) | 최초 반례 보존, 집중23·clippy·fmt 통과 |
 | 질문 오류·favicon·최종 조립·설치 | [question-integration](question-integration-20261118.md) | Rust141·Node35·browser4·실제 Claude 첫 대화·전역0.2.2 통과 |
+| 설계 시간 제한·기본값·실제 프로세스 종료 | [timeout-backend](timeout-backend-20261118.md) | 상한3600/기본1800, 집중20 통과·유료1 제외, 최초 반례 실패 보존 |
+| 시간 초과 안내·설정 조정·초안 재생성 | [timeout-ui](timeout-ui-20261118.md) | Node38·실제10초 timeout/복구와 설정 browser4 통과 |
+| 기존 기록·명시 설정 보존·최종 조립 | [timeout-integration](timeout-integration-20261118.md) | Rust149·Node38·browser4·전역0.2.3 통과 |
 
 최초 작업으로 참고할 이전 실행은 없었다. 후속 실행은 각 기록의 미검증·후속 조건을 먼저 확인한다.

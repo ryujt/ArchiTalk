@@ -1024,10 +1024,16 @@ async fn read_small(mut reader: impl AsyncRead + Unpin, cap: usize) -> Result<Ve
     }
 }
 fn validate_spec(spec: &RunSpec) -> Result<(), AiError> {
-    if spec.timeout_seconds == 0 || spec.timeout_seconds > 600 {
+    if !(crate::config::AI_ADAPTER_MIN_TIMEOUT_SECONDS..=crate::config::AI_MAX_TIMEOUT_SECONDS)
+        .contains(&spec.timeout_seconds)
+    {
         return Err(AiError::new(
             "invalid_settings",
-            "Timeout must be between 1 and 600 seconds.",
+            format!(
+                "Timeout must be between {} and {} seconds.",
+                crate::config::AI_ADAPTER_MIN_TIMEOUT_SECONDS,
+                crate::config::AI_MAX_TIMEOUT_SECONDS
+            ),
         ));
     }
     if spec.prompt.is_empty() || spec.prompt.len() > FRAME_LIMIT {
@@ -1287,7 +1293,7 @@ pub async fn generate(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => { failure = Some(AiError::new("cancelled", "Generation was cancelled.")); break; }
-            _ = &mut deadline => { failure = Some(AiError::new("timeout", "AI CLI reached its wall-time limit.")); break; }
+            _ = &mut deadline => { failure = Some(AiError::new("timeout", format!("AI CLI reached its {}-second wall-time limit.", spec.timeout_seconds))); break; }
             result = &mut stdout, if !stdout_done => {
                 stdout_done = true;
                 match task_result(result) { Ok(value) => parsed = Some(value), Err(error) => { failure = Some(error); break; } }
@@ -1363,10 +1369,11 @@ pub async fn generate(
         return Err(error);
     }
     if let Some(mut error) = failure {
-        error.message.push_str(&format!(
-            " [stderr: {}]",
-            failure_line_summaries(retained.as_deref().unwrap_or_default())
-        ));
+        if let Some(bytes) = retained.as_deref().filter(|bytes| !bytes.is_empty()) {
+            error
+                .message
+                .push_str(&format!(" [stderr: {}]", failure_line_summaries(bytes)));
+        }
         return Err(error);
     }
     if !status.unwrap().success() {

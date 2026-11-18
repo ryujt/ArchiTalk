@@ -146,7 +146,7 @@ export function settingsFromValues(current, values) {
   const value = name => String(values[name] || '').trim() || null;
   if (Object.hasOwn(values, 'timeout-seconds')) {
     const timeout = Number(values['timeout-seconds']);
-    if (!Number.isInteger(timeout) || timeout < 10 || timeout > 600) throw new ApiError(400, {error:{code:'INVALID_SETTINGS',message:'작업 시간 제한은 10~600초 사이의 정수로 입력해 주세요.'}});
+    if (!Number.isInteger(timeout) || timeout < 10 || timeout > 3600) throw new ApiError(400, {error:{code:'INVALID_SETTINGS',message:'작업 시간 제한은 10~3600초 사이의 정수로 입력해 주세요.'}});
     settings.ai.timeout_seconds = timeout;
   }
   settings.ai.default_backend = value('default-backend');
@@ -163,6 +163,12 @@ export function settingsFromValues(current, values) {
 
 function runIsActive(run) { return Boolean(run && ACTIVE_STATUSES.has(run.status)); }
 function unknownTermination(run) { return Boolean(run && (run.process_termination === 'unknown' || run.termination === 'unknown')); }
+function runTimedOut(run) { return run?.error?.code === 'timeout'; }
+function runTimeoutLabel(run) {
+  const seconds = run?.effective_settings?.timeout_seconds;
+  if (!Number.isSafeInteger(seconds) || seconds <= 0) return '';
+  return `${seconds}초${seconds >= 60 && seconds % 60 === 0 ? ` (${seconds / 60}분)` : ''}`;
+}
 function describeStatus(run) {
   return ({queued:'작업 대기 중', starting:'로컬 도구 시작 중', running:'답변을 받고 있어요', cancelling:'도구의 종료를 확인하고 있어요', completed:'작업 완료', succeeded:'작업 완료', cancelled:'중지 확인됨', interrupted:'중단된 작업', failed:'작업 실패'})[run?.status] || run?.status || '작업 상태 확인';
 }
@@ -232,6 +238,9 @@ export function startWorkspace(doc = document, win = window) {
   const globalRun = () => state.workspace?.active_run;
   const disabled = () => state.connectionBlocked || state.busy || runIsActive(state.run) || unknownTermination(state.run) || runIsActive(globalRun()) || unknownTermination(globalRun());
   const canRetryConversation = () => Boolean(state.session && state.run?.kind === 'conversation'
+    && ['failed','cancelled','interrupted'].includes(state.run.status)
+    && ['confirmed','manually_confirmed'].includes(state.run.process_termination));
+  const canRetryDesign = () => Boolean(state.session && state.run?.kind === 'design'
     && ['failed','cancelled','interrupted'].includes(state.run.status)
     && ['confirmed','manually_confirmed'].includes(state.run.process_termination));
   const envelope = (payload, revision = state.session?.revision) => ({command_id: win.crypto.randomUUID(), expected_revision: revision, payload});
@@ -615,7 +624,8 @@ export function startWorkspace(doc = document, win = window) {
 
   function pendingMessage() {
     const label = state.run?.status === 'cancelling' ? '도구의 종료를 확인하고 있어요' : ({conversation: '답변 작성 중…', design: '설계 초안 작성 중…', critic: '설계 초안 검토 중…'})[state.run?.kind] || '작업 진행 중…';
-    return `<article class="chat-turn pending-turn" aria-busy="true"><div class="avatar" aria-hidden="true">a</div><div class="chat-message"><div class="sender">ArchiTalk</div><p role="status">${esc(label)}</p><p class="small muted">완료되면 이 자리에 결과를 보여드려요.</p><div class="button-row">${button('cancel',state.run?.status==='cancelling'?'종료 확인 중':'작업 중지','quiet-button',state.busy||state.run?.status==='cancelling')}</div></div></article>`;
+    const limit = runTimeoutLabel(state.run);
+    return `<article class="chat-turn pending-turn" aria-busy="true"><div class="avatar" aria-hidden="true">a</div><div class="chat-message"><div class="sender">ArchiTalk</div><p role="status">${esc(label)}</p><p class="small muted">완료되면 이 자리에 결과를 보여드려요.</p>${limit?`<p class="small muted">요청당 시간 제한: ${esc(limit)}<br>설정 변경은 다음 작업부터 적용돼요.</p>`:''}<div class="button-row">${button('cancel',state.run?.status==='cancelling'?'종료 확인 중':'작업 중지','quiet-button',state.busy||state.run?.status==='cancelling')}</div></div></article>`;
   }
 
   function messages(pending = false) {
@@ -656,8 +666,8 @@ export function startWorkspace(doc = document, win = window) {
 
   function recovery() {
     const run = state.run, last = list(state.session?.messages).at(-1), lastExport = state.lastExport;
-    const retry = canRetryConversation();
-    return `<section class="status-card"><div class="status-icon ${unknownTermination(run)?'warn':''}" aria-hidden="true">↶</div><h1>남겨 둔 설계에서 이어가세요</h1><p>서버에 확인된 대화와 초안을 불러왔어요. 중단된 작업을 자동으로 다시 요청하지 않아요.</p><div class="recovery-details"><div><span>대화 주제</span><strong>${esc(state.session?.title)}</strong></div><div><span>마지막 대화</span><strong>${esc(formatTime(last?.created_at)||'기록 없음')}</strong></div><div><span>문서 상태</span><strong>${draft()?`초안 ${list(state.session.drafts).length}개 · ${draftIsCurrent(state.session,draft())?'현재':'이전'} 대화 기준`:'아직 생성하지 않음'}</strong></div>${run?`<div><span>최근 작업</span><strong>${esc(describeStatus(run))}</strong></div>`:''}${lastExport?`<div><span>최근 문서 반영</span><strong>${lastExport.status==='completed'?'저장 완료':lastExport.status==='preview'?'미리보기만 확인':lastExport.status==='conflict'?'충돌 · 새 사본 확인 필요':'저장 결과 확인 필요'}</strong></div>`:''}</div>${lastExport?.result?.paths?.length?`<div class="saved-path">${lastExport.result.paths.map(path=>`<strong>${esc(path)}</strong>`).join('')}</div>`:''}${unknownTermination(run)?`<div class="warning-box">이전 로컬 도구의 종료가 확인되지 않았어요. 실행한 터미널에서 해당 작업을 정리한 뒤 종료를 확인해 주세요. 확인 전에는 새 AI 작업을 시작할 수 없어요.</div><label class="confirm-row"><input type="checkbox" id="termination-confirm">이전 작업의 로컬 도구를 직접 종료했어요.</label><div class="button-row">${button('confirm-termination','수동 종료 확인','secondary',state.busy)}</div>`:''}<div class="button-row">${retry?button('retry-conversation','답변 다시 받기','primary',disabled()):''}${button('interview','이어서 대화하기',retry?'secondary':'primary',state.busy)}${draft()?button('review','초안 먼저 살펴보기','secondary',state.busy):''}${button('new-session','새 대화 시작','quiet-button',state.busy)}</div></section>`;
+    const retry = canRetryConversation(), retryDesign = canRetryDesign();
+    return `<section class="status-card"><div class="status-icon ${unknownTermination(run)?'warn':''}" aria-hidden="true">↶</div><h1>남겨 둔 설계에서 이어가세요</h1><p>서버에 확인된 대화와 초안을 불러왔어요. 중단된 작업을 자동으로 다시 요청하지 않아요.</p>${runTimedOut(run)?`<div class="warning-box"><p>${esc(timeoutExplanation())}</p>${button('timeout-settings','시간 제한 조정','secondary',state.busy)}</div>`:''}<div class="recovery-details"><div><span>대화 주제</span><strong>${esc(state.session?.title)}</strong></div><div><span>마지막 대화</span><strong>${esc(formatTime(last?.created_at)||'기록 없음')}</strong></div><div><span>문서 상태</span><strong>${draft()?`초안 ${list(state.session.drafts).length}개 · ${draftIsCurrent(state.session,draft())?'현재':'이전'} 대화 기준`:'아직 생성하지 않음'}</strong></div>${run?`<div><span>최근 작업</span><strong>${esc(describeStatus(run))}</strong></div>`:''}${lastExport?`<div><span>최근 문서 반영</span><strong>${lastExport.status==='completed'?'저장 완료':lastExport.status==='preview'?'미리보기만 확인':lastExport.status==='conflict'?'충돌 · 새 사본 확인 필요':'저장 결과 확인 필요'}</strong></div>`:''}</div>${lastExport?.result?.paths?.length?`<div class="saved-path">${lastExport.result.paths.map(path=>`<strong>${esc(path)}</strong>`).join('')}</div>`:''}${unknownTermination(run)?`<div class="warning-box">이전 로컬 도구의 종료가 확인되지 않았어요. 실행한 터미널에서 해당 작업을 정리한 뒤 종료를 확인해 주세요. 확인 전에는 새 AI 작업을 시작할 수 없어요.</div><label class="confirm-row"><input type="checkbox" id="termination-confirm">이전 작업의 로컬 도구를 직접 종료했어요.</label><div class="button-row">${button('confirm-termination','수동 종료 확인','secondary',state.busy)}</div>`:''}<div class="button-row">${retry?button('retry-conversation','답변 다시 받기','primary',disabled()):''}${retryDesign?button('generate','초안 다시 생성','primary',disabled()):''}${button('interview','이어서 대화하기',retry||retryDesign?'secondary':'primary',state.busy)}${draft()?button('review','초안 먼저 살펴보기','secondary',state.busy):''}${button('new-session','새 대화 시작','quiet-button',state.busy)}</div></section>`;
   }
 
   function diagnosticStage() {
@@ -668,8 +678,17 @@ export function startWorkspace(doc = document, win = window) {
 
   function errorStage() {
     const cancelled = state.scene === 'paused';
-    const retry = canRetryConversation();
-    return `<section class="status-card"><div class="status-icon ${cancelled?'warn':'error'}" aria-hidden="true">${cancelled?'Ⅱ':'!'}</div><h1>${cancelled?'작업 중지를 확인했어요':'작업을 완료하지 못했어요'}</h1><p>${cancelled?'서버가 로컬 도구의 종료를 확인했어요.':'마지막으로 확인된 대화와 완성된 초안에서 이어갈 수 있어요.'}</p>${state.run?.error?`<div class="error-detail">${esc(typeof state.run.error==='string'?state.run.error:state.run.error.message || state.run.error.code)}</div>`:''}<div class="button-row">${retry?button('retry-conversation','답변 다시 받기','primary',disabled()):''}${button('interview','대화로 돌아가기',retry?'secondary':'primary')}${draft()?button('review','완성된 초안 보기'):''}${button('generate','현재 답변으로 다시 정리','secondary',disabled())}${button('settings','도구 설정 확인','quiet-button')}</div><p class="progress-foot">${retry?'답변 다시 받기는 마지막 사용자 입력으로 새 AI 작업을 시작해요. 대화에 같은 입력을 추가하지 않아요.':'다시 정리하기는 새 AI 작업을 시작해요. 이전 응답을 자동으로 재실행하지 않아요.'}</p></section>`;
+    const retry = canRetryConversation(), retryDesign = canRetryDesign(), timeout = runTimedOut(state.run);
+    const reviewFirst = state.run?.kind === 'critic' && draft();
+    const detail = state.run?.error ? esc(typeof state.run.error === 'string' ? state.run.error : state.run.error.message || state.run.error.code) : '';
+    const explanation = timeout ? timeoutExplanation() : cancelled ? '서버가 로컬 도구의 종료를 확인했어요.' : '마지막으로 확인된 대화와 완성된 초안에서 이어갈 수 있어요.';
+    return `<section class="status-card"><div class="status-icon ${cancelled?'warn':'error'}" aria-hidden="true">${cancelled?'Ⅱ':'!'}</div><h1>${timeout?'작업 시간이 초과됐어요':cancelled?'작업 중지를 확인했어요':'작업을 완료하지 못했어요'}</h1><p>${esc(explanation)}</p>${detail?timeout?`<details class="error-detail"><summary>세부 오류</summary><p>${detail}</p></details>`:`<div class="error-detail">${detail}</div>`:''}<div class="button-row">${timeout?button('timeout-settings','시간 제한 조정',retryDesign?'primary':'secondary',state.busy):''}${retry?button('retry-conversation','답변 다시 받기','primary',disabled()):''}${retryDesign?button('generate','초안 다시 생성',timeout?'secondary':'primary',disabled()):''}${button('interview','대화로 돌아가기',retry||retryDesign||reviewFirst?'secondary':'primary')}${draft()?button('review','완성된 초안 보기',reviewFirst?'primary':'secondary'):''}${state.run?.kind!=='design'?button('generate','현재 답변으로 다시 정리','secondary',disabled()):''}${button('settings','도구 설정 확인','quiet-button')}</div><p class="progress-foot">${timeout?'시간 제한 변경은 다음 작업부터 적용돼요. 작업은 자동으로 재실행하지 않아요.':retry?'답변 다시 받기는 마지막 사용자 입력으로 새 AI 작업을 시작해요. 대화에 같은 입력을 추가하지 않아요.':'다시 생성하기는 새 AI 작업을 시작해요. 이전 응답을 자동으로 재실행하지 않아요.'}</p></section>`;
+  }
+
+  function timeoutExplanation() {
+    const operation = ({conversation:'답변 작성',design:'설계 초안 작성',critic:'설계 초안 검토'})[state.run?.kind] || 'AI 작업';
+    const limit = runTimeoutLabel(state.run);
+    return `${operation} 요청에 적용된 ${limit ? `${limit}의 시간 제한에 도달했어요.` : '시간 제한에 도달했어요.'} 대화와 완성된 초안은 그대로 보존되어 있어요. 시간 제한을 조정한 뒤 다시 요청할 수 있어요.`;
   }
 
   function saved() {
@@ -746,7 +765,7 @@ export function startWorkspace(doc = document, win = window) {
 
   function settingsModal() {
     const settings = state.settings || {}, ai = settings.ai || {}, backends = ai.backends || {};
-    return `${header('답변에 사용할 도구')}<div class="dialog-body"><p>로컬 Claude Code 또는 Codex의 기존 로그인을 사용해요. 설치·help 진단은 로그인이나 모델 응답을 시험하지 않아요. 에이전트·모델·생각 수준·시간 제한은 모든 프로젝트에 공통 적용되며, 문서 저장 폴더는 현재 프로젝트에만 적용돼요.</p><div id="modal-error">${modalError()}</div><form id="settings-form"><div class="form-field"><label for="default-backend">기본 도구</label><select id="default-backend" name="default-backend">${['claude','codex'].map(kind=>`<option value="${kind}"${(ai.default_backend||'claude')===kind?' selected':''}>${kind==='claude'?'Claude Code':'Codex'}</option>`).join('')}</select></div><div class="form-field"><label for="timeout-seconds">작업 시간 제한(초)</label><input id="timeout-seconds" name="timeout-seconds" type="number" min="10" max="600" step="1" required value="${esc(ai.timeout_seconds ?? '')}" aria-describedby="timeout-seconds-help"><small id="timeout-seconds-help">각 AI 요청을 기다리는 시간을 10~600초 사이의 정수로 설정해요. 변경은 다음 작업부터 적용돼요.</small></div><div class="diagnostics" id="cli-diagnostics">${diagnosticsHTML()}</div>${button('diagnose','설치·버전 진단','secondary',state.busy)}${['claude','codex'].map(kind=>{
+    return `${header('답변에 사용할 도구')}<div class="dialog-body"><p>로컬 Claude Code 또는 Codex의 기존 로그인을 사용해요. 설치·help 진단은 로그인이나 모델 응답을 시험하지 않아요. 에이전트·모델·생각 수준·시간 제한은 모든 프로젝트에 공통 적용되며, 문서 저장 폴더는 현재 프로젝트에만 적용돼요.</p><div id="modal-error">${modalError()}</div><form id="settings-form"><div class="form-field"><label for="default-backend">기본 도구</label><select id="default-backend" name="default-backend">${['claude','codex'].map(kind=>`<option value="${kind}"${(ai.default_backend||'claude')===kind?' selected':''}>${kind==='claude'?'Claude Code':'Codex'}</option>`).join('')}</select></div><div class="form-field"><label for="timeout-seconds">작업 시간 제한(초)</label><input id="timeout-seconds" name="timeout-seconds" type="number" min="10" max="3600" step="1" required value="${esc(ai.timeout_seconds ?? 1800)}" aria-describedby="timeout-seconds-help"><small id="timeout-seconds-help">각 AI 요청을 기다리는 시간을 10~3600초 사이의 정수로 설정해요. 형식 보정이나 비판 검토가 이어지면 요청마다 제한을 따로 적용해요. 변경은 다음 작업부터 적용돼요.</small></div><div class="diagnostics" id="cli-diagnostics">${diagnosticsHTML()}</div>${button('diagnose','설치·버전 진단','secondary',state.busy)}${['claude','codex'].map(kind=>{
       const base=backends[kind] || {};
       return `<section class="settings-section"><h3>${kind==='claude'?'Claude Code':'Codex'} 기본 설정</h3><div class="form-field"><label for="${kind}-executable">신뢰된 실행 파일</label><input id="${kind}-executable" readonly value="${esc(base.executable || kind)}"><small>실행 파일 변경은 터미널의 사용자 전역 설정에서 해 주세요.</small></div>${kind==='codex'?`<div class="form-field"><label for="codex-profile">Codex profile</label><input id="codex-profile" readonly value="${esc(base.profile || 'CLI 기본 profile')}"><small>신뢰된 사용자 전역 설정의 profile을 사용해요.</small></div>`:''}<div class="field-grid">${settingField(kind,'model',base.model,kind)}${settingField(kind,'effort',base.effort,kind)}</div><p class="capability-note">목록은 알려진 값의 예시예요. 계정·CLI·모델별 사용 가능 여부는 실제 요청에서 확인돼요. 목록에 없는 값도 직접 입력할 수 있어요.</p></section>`;
     }).join('')}<details class="settings-section" open><summary>역할마다 다르게 설정하기 · 선택</summary>${['conversation','design','critic'].map((role,i)=>{
@@ -779,7 +798,7 @@ export function startWorkspace(doc = document, win = window) {
     state.dialogScroll={left: win.scrollX, top: win.scrollY, behavior: 'instant'};
   }
 
-  async function openSettings(target) {
+  async function openSettings(target, {focusTimeout = false} = {}) {
     captureDialogFocus(target);
     await command(async()=> {
       const result = await api(`${API_ROOT}settings`);
@@ -788,6 +807,7 @@ export function startWorkspace(doc = document, win = window) {
       state.choices=result.choices || {};
       state.modal='settings';
     });
+    if (focusTimeout && state.modal === 'settings' && dialog.open && !state.connectionBlocked) $('timeout-seconds')?.focus();
   }
 
   async function approve() {
@@ -854,6 +874,7 @@ export function startWorkspace(doc = document, win = window) {
     const action=target.dataset.action;
     if (action==='inspect-document') { selectDocument(target.dataset.documentKind); return; }
     if (action==='settings') { void openSettings(target); return; }
+    if (action==='timeout-settings') { void openSettings(target,{focusTimeout:true}); return; }
     if (action==='new-session') { newSession(); return; }
     if (action==='close-modal') { closeModal(); return; }
     if (action==='toggle-info') { const open=doc.body.classList.toggle('show-info'); target.setAttribute('aria-expanded',String(open)); return; }
@@ -877,8 +898,10 @@ export function startWorkspace(doc = document, win = window) {
       });
       return;
     }
-    if (action==='generate') { void command(async()=> {
-      const result=await api(sessionPath('/draft'),{method:'POST',body:envelope({})}); adoptResult(result); announce('설계 정리를 시작했어요.');
+    if (action==='generate') { if (disabled()) return; void command(async()=> {
+      const result=await api(sessionPath('/draft'),{method:'POST',body:envelope({})});
+      if (draft() && ['error','paused','recovery'].includes(state.scene)) state.scene='review';
+      adoptResult(result); announce('설계 정리를 시작했어요.');
     }); return; }
     if (action==='critic') { void command(async()=> {
       adoptResult(await api(sessionPath('/critic'),{method:'POST',body:envelope({})}));

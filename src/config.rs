@@ -9,6 +9,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const AI_DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
+pub const AI_MIN_TIMEOUT_SECONDS: u64 = 10;
+/// The adapter's lower bound permits short synthetic process-termination tests.
+pub const AI_ADAPTER_MIN_TIMEOUT_SECONDS: u64 = 1;
+pub const AI_MAX_TIMEOUT_SECONDS: u64 = 3600;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
@@ -62,7 +68,7 @@ impl Default for AiConfig {
     fn default() -> Self {
         Self {
             default_backend: Backend::Claude,
-            timeout_seconds: 300,
+            timeout_seconds: AI_DEFAULT_TIMEOUT_SECONDS,
             backends: Backends::default(),
             roles: Roles::default(),
         }
@@ -128,8 +134,10 @@ impl Settings {
         }
     }
     pub fn validate(&self) -> Result<()> {
-        if !(10..=600).contains(&self.ai.timeout_seconds) {
-            bail!("timeout_seconds must be between 10 and 600");
+        if !(AI_MIN_TIMEOUT_SECONDS..=AI_MAX_TIMEOUT_SECONDS).contains(&self.ai.timeout_seconds) {
+            bail!(
+                "timeout_seconds must be between {AI_MIN_TIMEOUT_SECONDS} and {AI_MAX_TIMEOUT_SECONDS}"
+            );
         }
         for b in [&self.ai.backends.claude, &self.ai.backends.codex] {
             if b.executable.trim().is_empty()

@@ -339,7 +339,7 @@ prompt=sys.stdin.read()
         let root = tempfile::tempdir().unwrap();
         let fixture = tempfile::tempdir().unwrap();
 
-        let body = "signal.signal(signal.SIGTERM,signal.SIG_IGN)\nwith open('pid','w') as out:\n    out.write(str(os.getpid()))\ntime.sleep(120)".to_owned();
+        let body = "signal.signal(signal.SIGTERM,signal.SIG_IGN)\nwith open('pid','w') as out:\n    out.write(str(os.getpid()))\nprint(json.dumps({'type':'system','subtype':'init','tools':[],'mcp_servers':[],'permissionMode':'dontAsk','model':'fake-model'}),flush=True)\nprint(json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':'unfinished partial response'}]}}),flush=True)\ntime.sleep(120)".to_owned();
         let executable = fake_cli(fixture.path(), &body);
         let mut request = spec(executable, root.path());
         request.timeout_seconds = 1;
@@ -353,6 +353,10 @@ prompt=sys.stdin.read()
         assert_eq!(error.code, "timeout");
         assert!(!error.termination_unknown, "{error:?}");
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            error.message,
+            "AI CLI reached its 1-second wall-time limit."
+        );
     }
     #[tokio::test]
     async fn consumed_io_task_errors_return_ai_errors_without_panicking() {

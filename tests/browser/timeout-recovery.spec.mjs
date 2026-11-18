@@ -1,0 +1,83 @@
+import {test,expect} from './fixtures.mjs';
+import {writeFile} from 'node:fs/promises';
+
+test('a real design timeout preserves the draft and retries only after a time-limit change and explicit click',async({server,productPage},testInfo)=>{
+  const {page,errors,violations}=productPage;
+  const posts=[];
+  page.on('request',request=>{
+    const path=new URL(request.url()).pathname;
+    if(path.startsWith('/api/v1/')&&request.method()==='POST')posts.push({path,payload:request.postDataJSON().payload});
+  });
+  await page.goto(server.origin,{waitUntil:'domcontentloaded'});
+  await page.locator('#project-intro').fill('합성 로컬 알림의 기존 대화와 초안을 보존합니다.');
+  await page.locator('#start-form button[type=submit]').click();
+  await expect(page.locator('.chat-turn')).toHaveCount(2);
+  await page.locator('[data-action=generate]').click();
+  await expect.poll(async()=>{const w=await server.workspace();return w.active_run===null&&w.sessions[0]?.drafts[0]?.reviewed;}).toBe(true);
+  await expect(page.locator('.markdown')).toHaveAttribute('data-render-state','ready');
+  await page.locator('#document-kind-picker').selectOption('state');
+  await expect(page.locator('.markdown')).toHaveAttribute('data-document-kind','state');
+  const original=await server.workspace(),oldDraft=original.sessions[0].drafts[0],originalMessages=original.sessions[0].messages;
+  const openSettings=()=>page.getByRole('button',{name:'도구 설정',exact:true}).click();
+  await openSettings();await expect(page.getByRole('dialog')).toBeVisible();
+  await page.locator('#timeout-seconds').fill('10');
+  await page.locator('#settings-form button[type=submit]').click();await expect(page.getByRole('dialog')).not.toBeVisible();
+  await expect(page.locator('#document-kind-picker')).toHaveValue('state');
+  await server.configureDesignDelay(30);
+  await page.locator('[data-action=generate]').click();
+  await expect(page.locator('.pending-turn')).toContainText('요청당 시간 제한: 10초');
+  await expect(page.locator('#document-kind-picker')).toHaveValue('state');
+  await expect(page.locator('.markdown')).toHaveAttribute('data-render-state','ready');
+  await page.screenshot({path:testInfo.outputPath('01-existing-draft-during-pending.png'),fullPage:true,animations:'disabled'});
+  await expect(page.getByRole('heading',{name:'작업 시간이 초과됐어요',exact:true})).toBeVisible();
+  await expect(page.locator('#workspace-content')).toContainText('설계 초안 작성 요청에 적용된 10초');
+  await expect(page.getByRole('button',{name:'초안 다시 생성',exact:true})).toBeEnabled();
+  const failed=await server.workspace(),failedRun=failed.runs.at(-1);
+  expect(failed.runs).toHaveLength(4);expect(failed.active_run).toBeNull();
+  expect(failedRun).toMatchObject({kind:'design',status:'failed',process_termination:'confirmed',error:{code:'timeout'},effective_settings:{timeout_seconds:10}});
+  expect(failed.sessions[0].drafts).toEqual([oldDraft]);expect(failed.sessions[0].messages).toEqual(originalMessages);
+  expect(failed.runs.slice(0,3)).toEqual(original.runs);
+  await page.screenshot({path:testInfo.outputPath('02-timeout-recovery-actions.png'),fullPage:true,animations:'disabled'});
+
+  await page.getByRole('button',{name:'시간 제한 조정',exact:true}).click();
+  await expect(page.getByRole('dialog')).toBeVisible();await expect(page.locator('#timeout-seconds')).toBeFocused();
+  await expect(page.locator('#timeout-seconds')).toHaveValue('10');await expect(page.locator('#timeout-seconds')).toHaveAttribute('max','3600');
+  await page.keyboard.press('Escape');await expect(page.getByRole('dialog')).not.toBeVisible();
+  await expect(page.getByRole('heading',{name:'작업 시간이 초과됐어요',exact:true})).toBeVisible();
+  expect((await server.workspace()).runs).toEqual(failed.runs);
+  await page.getByRole('button',{name:'시간 제한 조정',exact:true}).click();
+  await expect(page.locator('#timeout-seconds')).toBeFocused();await page.locator('#timeout-seconds').fill('1800');
+  await page.screenshot({path:testInfo.outputPath('03-focused-time-limit.png'),fullPage:true,animations:'disabled'});
+  await page.locator('#settings-form button[type=submit]').click();await expect(page.getByRole('dialog')).not.toBeVisible();
+  await expect(page.getByRole('heading',{name:'작업 시간이 초과됐어요',exact:true})).toBeVisible();
+  await expect(page.locator('#workspace-content')).toContainText('설계 초안 작성 요청에 적용된 10초');
+  const changed=await server.workspace();expect(changed.settings.ai.timeout_seconds).toBe(1800);expect(changed.runs).toEqual(failed.runs);
+  expect(changed.sessions[0].messages).toEqual(originalMessages);expect(changed.sessions[0].drafts).toEqual([oldDraft]);
+
+  // Hold only the new synthetic design until its real inline pending view is
+  // observed. Releasing it returns the normal 10-document package and critic.
+  await server.configureDesignDelay(0,{hold:true});
+  await page.getByRole('button',{name:'초안 다시 생성',exact:true}).click();
+  await expect(page.locator('.pending-turn')).toContainText('요청당 시간 제한: 1800초 (30분)');
+  await expect(page.locator('#document-kind-picker')).toHaveValue('state');
+  await expect(page.locator('.markdown')).toHaveAttribute('data-render-state','ready');
+  const retry=await server.workspace();expect(retry.runs).toHaveLength(5);expect(retry.active_run).toMatchObject({kind:'design',effective_settings:{timeout_seconds:1800}});
+  expect(retry.sessions[0].messages).toEqual(originalMessages);expect(retry.sessions[0].drafts).toEqual([oldDraft]);
+  await page.screenshot({path:testInfo.outputPath('04-new-limit-inline-pending.png'),fullPage:true,animations:'disabled'});
+  await server.configureDesignDelay(0);
+  await expect.poll(async()=>{const w=await server.workspace();return w.active_run===null&&w.sessions[0].drafts.length===2&&w.sessions[0].drafts[1].reviewed;}).toBe(true);
+  const completed=await server.workspace();
+  expect(completed.runs).toHaveLength(6);expect(completed.runs[3]).toEqual(failedRun);
+  expect(completed.runs.slice(4).map(run=>[run.kind,run.status,run.effective_settings.timeout_seconds])).toEqual([['design','completed',1800],['critic','completed',1800]]);
+  expect(completed.sessions[0].drafts[0]).toEqual(oldDraft);expect(completed.sessions[0].messages).toEqual(originalMessages);
+  expect(completed.sessions[0].drafts[1].id).not.toBe(oldDraft.id);
+  expect(completed.sessions[0].messages.filter(message=>message.role==='user')).toHaveLength(1);
+  expect(posts.map(request=>request.path)).toEqual(['/api/v1/sessions',...Array(3).fill(`/api/v1/sessions/${completed.sessions[0].id}/draft`)]);
+  expect(posts.slice(1).every(request=>JSON.stringify(request.payload)==='{}')).toBe(true);
+  await expect(page.locator('.markdown')).toHaveAttribute('data-render-state','ready');
+  await expect(page.locator('#document-kind-picker')).toHaveValue('state');
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+  await page.screenshot({path:testInfo.outputPath('05-recovered-draft.png'),fullPage:true,animations:'disabled'});
+  await writeFile(testInfo.outputPath('timeout-boundary.json'),JSON.stringify({actualTimeoutSeconds:failedRun.effective_settings.timeout_seconds,errorCode:failedRun.error.code,termination:failedRun.process_termination,changedLimit:changed.settings.ai.timeout_seconds,retryLimit:retry.active_run.effective_settings.timeout_seconds,userMessages:1,drafts:2,preservedOldDraft:true,postCommands:posts.length},null,2));
+  expect(errors).toEqual([]);expect(violations).toEqual([]);
+});

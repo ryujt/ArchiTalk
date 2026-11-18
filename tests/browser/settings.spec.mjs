@@ -64,9 +64,9 @@ test('known model choices and free input survive backend changes, save, reload a
   expect(response.diagnostics).toEqual([]);
   const timeout=page.getByLabel('작업 시간 제한(초)',{exact:true});
   await expect(timeout).toHaveValue(String(initial.settings.ai.timeout_seconds));
-  await expect(timeout).toHaveAttribute('min','10');await expect(timeout).toHaveAttribute('max','600');
+  await expect(timeout).toHaveAttribute('min','10');await expect(timeout).toHaveAttribute('max','3600');
   await expect(timeout).toHaveAttribute('step','1');await expect(timeout).toHaveAttribute('required','');
-  for(const invalid of ['9','601','10.5','']){
+  for(const invalid of ['9','3601','10.5','']){
     await timeout.fill(invalid);expect(await timeout.evaluate(input=>input.validity.valid)).toBe(false);
     await page.locator('#settings-form button[type="submit"]').click();
     await expect(page.getByRole('dialog')).toBeVisible();expect(timeoutPatches).toEqual([]);

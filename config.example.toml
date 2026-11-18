@@ -1,6 +1,9 @@
 [ai]
 default_backend = "claude"
-timeout_seconds = 300
+# Each model request has a fixed wall-time limit, including thinking/output.
+# Allowed: 10..3600 seconds. Changes apply to the next new task.
+# An active task and its schema repair keep the captured limit.
+timeout_seconds = 1800
 
 [ai.backends.claude]
 executable = "claude"

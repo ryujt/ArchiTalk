@@ -50,12 +50,28 @@ async function startServer() {
   }
   const conversationControl=join(tools,'question-overflow.json');
   let conversationControlled=false;
+  const designControl=join(tools,'design-delay.json');
+  let designControlled=false;
   const writeConversationControl=async value=>{
     await writeFile(`${conversationControl}.tmp`,JSON.stringify(value));
     await rename(`${conversationControl}.tmp`,conversationControl);
   };
   return {
     ...endpoint,project,
+    async configureDesignDelay(seconds,{hold=false}={}){
+      if(!Number.isFinite(seconds)||seconds<0||seconds>30||typeof hold!=='boolean')throw new Error('Invalid isolated design delay.');
+      // Atomic parent writes; the child reads only this test-owned input.
+      await writeFile(`${designControl}.tmp`,JSON.stringify({seconds,hold}));
+      await rename(`${designControl}.tmp`,designControl);
+      if(!designControlled){
+        const source=await readFile(executable,'utf8');
+        const marker="elif task.startswith('Create an implementable'):\n";
+        if(!source.includes(marker))throw new Error('Design fixture shape changed.');
+        const injected=`${marker} control=Path(__file__).with_name('design-delay.json')\n deadline=time.monotonic()+15\n while True:\n  design_control=json.loads(control.read_text(encoding='utf-8'))\n  if not design_control['hold']:break\n  if time.monotonic()>deadline:raise RuntimeError('test parent did not release its design fixture')\n  time.sleep(0.02)\n if design_control['seconds']:time.sleep(design_control['seconds'])\n`;
+        await writeFile(executable,source.replace(marker,injected));
+        designControlled=true;
+      }
+    },
     async configureConversationOverflow(enabled,{hold=false}={}){
       if(typeof enabled!=='boolean'||typeof hold!=='boolean')throw new Error('Conversation fixture controls must be booleans.');
       if(!conversationControlled){
